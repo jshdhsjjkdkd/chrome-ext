@@ -2,6 +2,7 @@ const _k = ["Z3NrX2xvUGwxMlh0VH", "JYVWM3c3pHejhSV0dk", "eWIzRllQelRKRUVnUn", "d
 const GROQ_API_KEY = atob(_k.join(""));
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODEL_FAST = "llama-3.1-8b-instant";
 
 let stopRequested = false;
 
@@ -10,8 +11,9 @@ function log(msg) {
   chrome.runtime.sendMessage({ type: "log", text: msg }).catch(() => {});
 }
 
-async function callGroq(systemPrompt, userPrompt) {
-  log("Calling Groq AI...");
+async function callGroq(systemPrompt, userPrompt, model) {
+  const useModel = model || GROQ_MODEL;
+  log(`Calling Groq AI (${useModel})...`);
   const res = await fetch(GROQ_ENDPOINT, {
     method: "POST",
     headers: {
@@ -19,13 +21,13 @@ async function callGroq(systemPrompt, userPrompt) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model: useModel,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
       ],
-      temperature: 0.1,
-      max_tokens: 2048
+      temperature: 0,
+      max_tokens: 1024
     })
   });
 
@@ -49,58 +51,35 @@ async function callGroq(systemPrompt, userPrompt) {
 }
 
 function getSystemPrompt(hasHtml) {
-  let prompt = `You are a browser automation assistant. The user gives natural language commands and you return JSON actions to execute.
+  let prompt = `Browser automation bot. Return ONLY valid JSON, no markdown.
+Format: {"actions":[...],"explanation":"brief"}
 
-You MUST respond with valid JSON only, no markdown, no explanation outside JSON. Use this exact format:
-{
-  "actions": [ ... ],
-  "explanation": "brief explanation"
-}
+Action types:
+- navigate: {"type":"navigate","url":"https://..."}
+- click: {"type":"click","selector":"css"}
+- fill: {"type":"fill","selector":"css","value":"text"}
+- select: {"type":"select","selector":"css","value":"val"}
+- check: {"type":"check","selector":"css","checked":true}
+- submit: {"type":"submit","selector":"css"}
+- scroll: {"type":"scroll","direction":"down","amount":500}
+- wait: {"type":"wait","duration":1500}
+- getText: {"type":"getText","selector":"css"}
 
-Available action types:
-
-1. navigate - Go to a URL
-   { "type": "navigate", "url": "https://example.com" }
-
-2. click - Click an element by CSS selector
-   { "type": "click", "selector": "button.login" }
-
-3. fill - Type text into an input field
-   { "type": "fill", "selector": "input[name='search']", "value": "search text" }
-
-4. select - Select an option from a dropdown
-   { "type": "select", "selector": "select#country", "value": "US" }
-
-5. check - Check/uncheck a checkbox
-   { "type": "check", "selector": "input[type='checkbox']", "checked": true }
-
-6. submit - Submit a form
-   { "type": "submit", "selector": "form#login" }
-
-7. scroll - Scroll the page
-   { "type": "scroll", "direction": "down", "amount": 500 }
-
-8. wait - Wait for a specified time in milliseconds
-   { "type": "wait", "duration": 1500 }
-
-9. getText - Get text content of an element
-   { "type": "getText", "selector": ".result" }
-
-Rules:
-- For multi-step commands like "go to youtube and search for cats", return multiple actions: navigate, then wait (1500ms for page load), then fill the search input, then click search or submit.
-- Always use full URLs with https:// for navigation.
-- For well-known sites, use their correct URLs (e.g. youtube.com, gmail.com, xbox.com, twitter.com, etc).
-- When you need to interact with elements on a page, use the provided HTML context to find accurate CSS selectors.
-- Prefer stable selectors: name attributes, IDs, aria-labels, data attributes, then tag+class combos.
-- If no HTML context is provided, you may still return navigate actions or your best guess for common sites.`;
+Rules: Multi-step commands = multiple actions (navigate,wait 1500ms,fill,click). Use full https:// URLs. Use correct URLs for known sites. Prefer selectors by: id > name > aria-label > data-attr > class.`;
 
   if (hasHtml) {
-    prompt += `\n\nThe user has provided the current page HTML. Use it to determine accurate CSS selectors for interaction actions.`;
+    prompt += ` HTML context provided below — use it for accurate selectors.`;
   } else {
-    prompt += `\n\nNo page HTML is available (the page may be a protected browser page or a new tab). Focus on navigation actions.`;
+    prompt += ` No HTML available. Focus on navigation.`;
   }
 
   return prompt;
+}
+
+function shouldUseFastModel(command, hasHtml) {
+  if (hasHtml) return false;
+  const simple = /^(go to|open|visit|navigate to|take me to)\s/i.test(command);
+  return simple;
 }
 
 async function getActiveTab() {
@@ -234,9 +213,11 @@ async function handleCommand(command) {
       userPrompt += `\n\nCurrent page URL: ${tab.url || "new tab"}`;
     }
 
-    // Call Groq AI
+    // Call Groq AI — use fast model for simple navigation
     const systemPrompt = getSystemPrompt(!!pageHtml);
-    const aiResponse = await callGroq(systemPrompt, userPrompt);
+    const useFast = shouldUseFastModel(command, !!pageHtml);
+    const model = useFast ? GROQ_MODEL_FAST : GROQ_MODEL;
+    const aiResponse = await callGroq(systemPrompt, userPrompt, model);
 
     if (!aiResponse.actions || !Array.isArray(aiResponse.actions)) {
       throw new Error("AI response missing actions array");
