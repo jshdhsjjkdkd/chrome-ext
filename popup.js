@@ -10,23 +10,23 @@ const statusText = document.getElementById("statusText");
 let running = false;
 let port = null;
 
-// --- Persistent port connection to background ---
 function connectPort() {
   port = chrome.runtime.connect({ name: "popup" });
   port.onMessage.addListener((msg) => {
-    if (msg.type === "log") addLog(msg.text, msg.level || "info");
-    if (msg.type === "done") setRunning(false, "done");
+    if (msg.type === "log") addLog(msg.text, msg.level);
+    if (msg.type === "done") {
+      addLog("Done", "success");
+      setRunning(false, "done");
+    }
     if (msg.type === "error") setRunning(false, "error");
   });
   port.onDisconnect.addListener(() => {
     port = null;
-    // Reconnect if popup is still open
     setTimeout(() => { if (!port) connectPort(); }, 500);
   });
 }
 connectPort();
 
-// --- Logging ---
 function addLog(text, level) {
   const entry = document.createElement("div");
   entry.classList.add("log-entry");
@@ -40,10 +40,7 @@ function addLog(text, level) {
   statusLog.appendChild(entry);
   statusLog.scrollTop = statusLog.scrollHeight;
 
-  // Keep log from growing too large
-  while (statusLog.children.length > 200) {
-    statusLog.removeChild(statusLog.firstChild);
-  }
+  while (statusLog.children.length > 100) statusLog.removeChild(statusLog.firstChild);
 }
 
 function escapeHtml(str) {
@@ -52,7 +49,6 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
-// --- State ---
 function setRunning(isRunning, reason) {
   running = isRunning;
   executeBtn.disabled = isRunning;
@@ -62,7 +58,7 @@ function setRunning(isRunning, reason) {
   statusIndicator.className = "";
   if (isRunning) {
     statusIndicator.classList.add("running");
-    statusText.textContent = "Running...";
+    statusText.textContent = "Working...";
   } else if (reason === "error") {
     statusIndicator.classList.add("error");
     statusText.textContent = "Error";
@@ -71,7 +67,6 @@ function setRunning(isRunning, reason) {
   }
 }
 
-// --- Execute ---
 function executeCommand() {
   const command = commandInput.value.trim();
   if (!command || running) return;
@@ -83,46 +78,31 @@ function executeCommand() {
   if (port) {
     port.postMessage({ type: "execute", command });
   } else {
-    // Fallback to one-shot message
     chrome.runtime.sendMessage({ type: "execute", command }, (response) => {
       if (chrome.runtime.lastError) {
-        addLog(`Connection error: ${chrome.runtime.lastError.message}`, "error");
+        addLog(chrome.runtime.lastError.message, "error");
         setRunning(false, "error");
       } else if (response && !response.success) {
-        addLog(`Error: ${response.error}`, "error");
+        addLog(response.error, "error");
         setRunning(false, "error");
       } else {
+        addLog("Done", "success");
         setRunning(false, "done");
       }
     });
   }
 }
 
-// --- Event listeners ---
 executeBtn.addEventListener("click", executeCommand);
 
 commandInput.addEventListener("keydown", (e) => {
-  // Ctrl/Cmd+Enter to execute
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault();
-    executeCommand();
-    return;
-  }
-  // Plain Enter on single-line also executes
-  if (e.key === "Enter" && !e.shiftKey && commandInput.value.indexOf("\n") === -1) {
-    e.preventDefault();
-    executeCommand();
-  }
-  // Up arrow when empty loads last command
-  if (e.key === "ArrowUp" && commandInput.value === "") {
-    e.preventDefault();
-    loadLastHistory();
-  }
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); executeCommand(); return; }
+  if (e.key === "Enter" && !e.shiftKey && !commandInput.value.includes("\n")) { e.preventDefault(); executeCommand(); }
+  if (e.key === "ArrowUp" && commandInput.value === "") { e.preventDefault(); loadLastHistory(); }
 });
 
 commandInput.addEventListener("input", () => {
   charCount.textContent = commandInput.value.length;
-  // Auto-resize
   commandInput.style.height = "auto";
   commandInput.style.height = Math.min(commandInput.scrollHeight, 120) + "px";
 });
@@ -130,16 +110,14 @@ commandInput.addEventListener("input", () => {
 stopBtn.addEventListener("click", () => {
   if (port) port.postMessage({ type: "stop" });
   else chrome.runtime.sendMessage({ type: "stop" });
-  addLog("Stop requested", "retry");
+  addLog("Stopped", "retry");
   setRunning(false);
 });
 
 clearBtn.addEventListener("click", () => {
   statusLog.innerHTML = "";
-  addLog("Log cleared", "info");
 });
 
-// --- Command history (chrome.storage.local) ---
 function saveHistory(cmd) {
   chrome.storage.local.get({ history: [] }, (data) => {
     const h = data.history.filter(c => c !== cmd);
@@ -156,5 +134,3 @@ function loadLastHistory() {
     }
   });
 }
-
-addLog("Ready. Type a command and press Enter or click Execute.", "info");
