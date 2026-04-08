@@ -94,17 +94,27 @@ RULES:
 3. Multi-step tasks: done:false until ALL steps are finished
 4. Return 1-3 actions per step. Don't rush — fewer actions = fewer errors.
 
+WHEN AN ACTION FAILS — STOP AND RETHINK:
+1. In "thought", explain WHY it failed based on the error message
+2. Think of 2-3 alternative approaches
+3. Try the BEST alternative — a different selector, a different element, or a different strategy
+4. NEVER repeat a failed selector. If click failed, maybe try submit. If a selector is wrong, pick another one from the elements list.
+5. If nothing on the page matches what you need, maybe you need to: scroll down, wait for loading, dismiss a popup/banner first, or go back and try a different path.
+
+HANDLING UNEXPECTED PAGES:
+- Cookie/consent banners → dismiss them first (click Accept/OK/Close/Got it)
+- "Stay signed in?" / "Remember me?" → click Yes/No and continue
+- CAPTCHA → return {"actions":[{"type":"wait","duration":5000}],"done":false,"thought":"CAPTCHA detected, waiting"}
+- Error messages (wrong password, locked account) → describe in thought, set done:true
+- 2FA / verification → look for available options and try to proceed
+- Blank or loading page → wait 2-3 seconds, then re-check
+- ANY popup or overlay → dismiss it before doing anything else
+
 NEVER GIVE UP:
-- If an action failed, read the error and try a DIFFERENT approach
-- If a page looks unexpected (popups, banners, prompts), handle them:
-  * Cookie/consent banners → click Accept/OK/Close
-  * "Stay signed in?" → click Yes or No
-  * CAPTCHA → return wait action (you cannot solve these)
-  * Error messages (wrong password, locked) → report in thought, set done:true
-  * 2FA/verification → look for options and try to proceed
-- If you don't see the element you need, try: scroll down, wait 2s, or look for alternative elements
-- If confused, describe what you see in "thought" and try the most logical next action
-- NEVER return done:true just because you're confused — only when the task is truly finished or impossible
+- NEVER return done:true just because you're confused
+- NEVER return empty actions unless the task is truly complete
+- If you've tried everything and nothing works, explain what you see in "thought" and try scroll + wait as a last resort
+- done:true ONLY means: the command is fully completed OR it's truly impossible (like wrong password)
 
 EXAMPLES:
 Element: input name="email" placeholder="Email" | input[name="email"]
@@ -281,6 +291,7 @@ async function handleCommand(command) {
     let consecutiveErrors = 0;
     let actionResults = null;
     let emptyCount = 0;
+    let failedSelectors = [];  // Track what failed so AI doesn't repeat
 
     for (let step = 0; step < MAX_STEPS; step++) {
       if (stopRequested) throw new StopError();
@@ -306,6 +317,8 @@ async function handleCommand(command) {
         }
       } else {
         stuckCount = 0;
+        // Page changed — clear failed selectors (they belong to the old page)
+        if (ctxHash !== lastCtxHash) failedSelectors = [];
       }
       lastCtxHash = ctxHash;
 
@@ -313,9 +326,17 @@ async function handleCommand(command) {
       let m = `Command: ${command}\nPage: ${tab.url}`;
       if (actionResults) {
         m += `\n\nYour last action results:\n${actionResults}`;
+        // If any action failed, force AI to rethink
+        if (actionResults.includes("FAILED:")) {
+          m += `\n\nIMPORTANT: Some actions FAILED. You MUST try a different approach. Explain in "thought" why it failed and what you'll try instead.`;
+        }
         actionResults = null;
       } else if (step > 0) {
         m += `\nStep ${step + 1}. Keep going.`;
+      }
+      // Tell AI what already failed so it doesn't repeat
+      if (failedSelectors.length > 0) {
+        m += `\n\nDO NOT use these selectors (already failed): ${failedSelectors.slice(-10).join(", ")}`;
       }
       if (ctx) {
         m += `\n\n${ctx}\n\nCopy selectors from after | exactly. Do NOT invent selectors.`;
@@ -365,14 +386,19 @@ async function handleCommand(command) {
         return;
       }
 
-      // Handle no actions but not done
+      // Handle no actions but not done — force AI to think harder
       if (actions.length === 0) {
         emptyCount++;
         if (emptyCount >= 4) {
-          log("AI returned no actions too many times", "error");
+          log("AI cannot figure out the page", "error");
           return;
         }
-        conv.push({ role: "user", content: `You returned no actions. The command "${command}" is not done. Look at the page elements above and return actions to proceed. If you see a popup or banner, dismiss it. If you need to scroll, scroll. Don't give up.` });
+        const nudge = emptyCount === 1
+          ? `You returned no actions but the command "${command}" is not done. Read the page elements carefully and return the next action.`
+          : emptyCount === 2
+          ? `Still no actions. STOP and THINK: What do you see on this page? Read the VISIBLE TEXT and ELEMENTS above. Is there a popup to dismiss? A button to click? An input to fill? Try ANYTHING that could help proceed with: "${command}"`
+          : `Last chance. Describe in "thought" exactly what you see on the page. Then try: 1) scrolling down 2) waiting 3) clicking any promising button/link. The command was: "${command}"`;
+        conv.push({ role: "user", content: nudge });
         continue;
       }
       emptyCount = 0;
@@ -394,8 +420,8 @@ async function handleCommand(command) {
         } catch (err) {
           if (err instanceof StopError) throw err;
           results.push(`FAILED: ${action.type} ${action.selector || ""} — ${err.message}`);
-          // Don't break — try remaining actions, some might still work
-          // But if it's a page access error, stop the batch
+          // Track failed selectors so AI won't repeat them
+          if (action.selector) failedSelectors.push(action.selector);
           if (err.message.includes("Can't access page")) break;
         }
 
