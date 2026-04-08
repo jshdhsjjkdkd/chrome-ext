@@ -276,7 +276,7 @@ async function handleCommand(command) {
     const conv = [{ role: "system", content: SYS }];
     let totalActions = 0;
     let lastUrl = "";
-    let lastCtxHash = "";
+    let lastCtxHash = 0;
     let stuckCount = 0;
     let actionResults = null;
 
@@ -295,7 +295,9 @@ async function handleCommand(command) {
         ctx = await readPage(tabId);
       }
 
-      const ctxHash = ctx ? ctx.substring(0, 500) : "";
+      // Stuck detection — hash the FULL context, not just the start
+      // (first 500 chars are always title/URL/headers which never change)
+      const ctxHash = ctx ? hashStr(ctx) : 0;
       if (tab.url === lastUrl && ctxHash === lastCtxHash && step > 0) {
         stuckCount++;
         if (stuckCount >= 5) {
@@ -384,3 +386,4 @@ async function handleCommand(command) {
 // ===========================================================
 class StopError extends Error { constructor() { super("Stopped"); } }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0; return h; }

@@ -99,7 +99,9 @@
       const href = el.getAttribute("href");
       if (href && !href.startsWith("javascript:")) parts.push(`href="${href.substring(0, 60)}"`);
     }
-    if (tag === "input" && el.type !== "password" && el.value) {
+    if (tag === "input" && el.type === "password" && el.value) {
+      parts.push(`value="[filled]"`);
+    } else if (tag === "input" && el.type !== "password" && el.value) {
       parts.push(`value="${el.value.substring(0, 30)}"`);
     }
     return parts.join(" ");
