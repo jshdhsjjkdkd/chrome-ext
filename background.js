@@ -1,8 +1,8 @@
 // --- Config ---
-const _k = ["Z3NrX2xvUGwxMlh0VH", "JYVWM3c3pHejhSV0dk", "eWIzRllQelRKRUVnUn", "dXelBScWVHMlY2SHRM", "MDI="];
-const GROQ_API_KEY = atob(_k.join(""));
-const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const _k = ["c2stcHJvai1ncXZxY1lnN08zZ2x4ajJHbTBXNFFu", "TGkyY0JrVlRkRDJQNlJBdWlacV9jemlpQ0Rj", "NHF5WFFBbG5XWkNWZlBUWnlremd4Vk9xbVQz", "Qmxia0ZKel9sYTQ5bHhHNlJPV21QOV9LdHl3", "V0xTUkxqY0xJaG1RTHBKalh0SDROdl9yamVh", "ZW5MQkxMS20wdWhPQ3dJVWhMTTJJT0k1d0E="];
+const API_KEY = atob(_k.join(""));
+const API_ENDPOINT = "https://api.openai.com/v1/chat/completions";
+const API_MODEL = "gpt-4o";
 
 const MAX_LOOP_STEPS = 20;
 const MAX_SELECTOR_RETRIES = 2;
@@ -99,14 +99,14 @@ BEHAVIOR RULES:
 async function callGroq(conversationMessages) {
   log("Thinking...", "ai");
 
-  const res = await fetch(GROQ_ENDPOINT, {
+  const res = await fetch(API_ENDPOINT, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${GROQ_API_KEY}`,
+      "Authorization": `Bearer ${API_KEY}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model: API_MODEL,
       messages: conversationMessages,
       temperature: 0,
       max_tokens: 1024
@@ -115,7 +115,7 @@ async function callGroq(conversationMessages) {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Groq API ${res.status}: ${errText.substring(0, 200)}`);
+    throw new Error(`API ${res.status}: ${errText.substring(0, 200)}`);
   }
 
   const data = await res.json();
