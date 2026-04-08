@@ -3,48 +3,51 @@ const _k = ["Z3NrX2xvUGwxMlh0VH", "JYVWM3c3pHejhSV0dk", "eWIzRllQelRKRUVnUn", "d
 const GROQ_API_KEY = atob(_k.join(""));
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
-const MAX_RETRIES = 2;
+
+const MAX_LOOP_STEPS = 20;
+const MAX_SELECTOR_RETRIES = 2;
 
 // --- State ---
 let stopRequested = false;
 let popupPort = null;
 
-// --- Logging ---
+// --- Logging (only via port, no broadcast duplication) ---
 function log(msg, level = "info") {
   console.log(`[BG] ${msg}`);
-  // Send via port (reliable) and broadcast (fallback)
-  const payload = { type: "log", text: msg, level };
   if (popupPort) {
-    try { popupPort.postMessage(payload); } catch (e) { /* port closed */ }
+    try { popupPort.postMessage({ type: "log", text: msg, level }); } catch (e) {}
   }
-  chrome.runtime.sendMessage(payload).catch(() => {});
 }
 
-// --- Port-based connection from popup ---
+// --- Port connection from popup ---
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name === "popup") {
-    popupPort = port;
-    port.onMessage.addListener((msg) => {
-      if (msg.type === "execute") {
-        handleCommand(msg.command).then(() => {
+  if (port.name !== "popup") return;
+  popupPort = port;
+
+  port.onMessage.addListener((msg) => {
+    if (msg.type === "execute") {
+      handleCommand(msg.command)
+        .then(() => {
           try { port.postMessage({ type: "done" }); } catch (e) {}
-        }).catch((err) => {
-          log(`Error: ${err.message}`, "error");
+        })
+        .catch((err) => {
+          if (!(err instanceof StopError)) log(`Error: ${err.message}`, "error");
           try { port.postMessage({ type: "error", error: err.message }); } catch (e) {}
         });
-      }
-      if (msg.type === "stop") {
-        stopRequested = true;
-        log("Execution stopped by user", "retry");
-      }
-    });
-    port.onDisconnect.addListener(() => { popupPort = null; });
-  }
+    }
+    if (msg.type === "stop") {
+      stopRequested = true;
+      log("Stopped by user", "retry");
+    }
+  });
+
+  port.onDisconnect.addListener(() => { popupPort = null; });
 });
 
-// Fallback one-shot message listener
+// Fallback one-shot listener (only if port is not connected)
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "execute") {
+  if (sender.id !== chrome.runtime.id) return;
+  if (msg.type === "execute" && !popupPort) {
     handleCommand(msg.command)
       .then(() => sendResponse({ success: true }))
       .catch(err => sendResponse({ success: false, error: err.message }));
@@ -52,58 +55,50 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === "stop") {
     stopRequested = true;
-    log("Execution stopped by user", "retry");
     sendResponse({ success: true });
   }
 });
 
-// --- Groq AI ---
-const SYSTEM_PROMPT = `You are a browser automation engine. You receive a user command and page context, and return actions as JSON.
+// ===========================================================
+// GROQ AI
+// ===========================================================
+const SYSTEM_PROMPT = `You are a browser automation agent. You work in a LOOP: each call you see the CURRENT page and return the NEXT batch of actions to perform. You will be called again after those actions complete with the updated page state.
 
-RESPONSE FORMAT (strict — return ONLY this JSON, nothing else):
-{"actions":[...],"explanation":"brief"}
+RESPONSE FORMAT — return ONLY valid JSON, no markdown, no extra text:
+{"actions":[...],"explanation":"brief","done":false}
+
+Set "done":true ONLY when the user's ENTIRE command has been fully completed (all steps finished, final page reached). Otherwise always set "done":false.
 
 ACTION TYPES:
-navigate  {"type":"navigate","url":"https://full-url.com"}
-click     {"type":"click","selector":"CSS selector"}
-fill      {"type":"fill","selector":"CSS selector","value":"text to type"}
-submit    {"type":"submit","selector":"CSS selector"}
-select    {"type":"select","selector":"CSS selector","value":"option value"}
-check     {"type":"check","selector":"CSS selector","checked":true}
-scroll    {"type":"scroll","direction":"down|up","amount":500}
-wait      {"type":"wait","duration":1500}
-getText   {"type":"getText","selector":"CSS selector"}
-pressKey  {"type":"pressKey","selector":"CSS selector","key":"Enter"}
+navigate   {"type":"navigate","url":"https://..."}
+click      {"type":"click","selector":"css"}
+fill       {"type":"fill","selector":"css","value":"text"}
+pressKey   {"type":"pressKey","selector":"css","key":"Enter"}
+submit     {"type":"submit","selector":"css"}
+select     {"type":"select","selector":"css","value":"val"}
+check      {"type":"check","selector":"css","checked":true}
+scroll     {"type":"scroll","direction":"down|up","amount":500}
+wait       {"type":"wait","duration":1500}
+getText    {"type":"getText","selector":"css"}
 
-SELECTOR PRIORITY (use the first one that works):
-1. #id
-2. [name="value"]
-3. [aria-label="value"]
-4. [data-testid="value"]
-5. [placeholder="value"]
-6. [role="button"] combined with text
-7. tag.class
+SELECTOR RULES:
+- ONLY use selectors you can see in the provided page elements. NEVER guess.
+- Each element in the page context has a sel="..." attribute — use that exact selector.
+- Priority: #id > [name] > [aria-label] > [data-testid] > [placeholder] > sel attribute.
 
-RULES:
-- ONLY use selectors from the provided HTML context. NEVER guess selectors.
-- For multi-step commands (e.g. "go to youtube and search cats"): return ONLY the navigate action. After navigation, you will be called again with the new page HTML for interaction actions.
-- Use full https:// URLs for navigation. Use correct URLs for known sites.
-- For search commands after navigation: fill the search input, then pressKey Enter on it.
-- Return minimal actions. Do NOT add unnecessary waits.
-- If the page HTML shows a search input, prefer filling it and pressing Enter rather than clicking a search button.`;
+BEHAVIOR RULES:
+- Return 1-4 actions per step. Do NOT try to do everything in one call.
+- After a navigate action, STOP and return. You'll get the new page in the next call.
+- For search: fill the search input, then pressKey Enter on it.
+- For login: fill email/username, fill password, then click/submit the login button.
+- For forms: fill fields one at a time in a single batch, then submit.
+- If the page has not changed and you already tried an action, try a different approach.
+- If no page elements are provided, you can only return navigate actions.
+- When all steps of the user's command are done, return {"actions":[],"explanation":"All done","done":true}.`;
 
-const RETRY_PROMPT = `The previous selector FAILED. Here is the error and the actual page elements.
+async function callGroq(conversationMessages) {
+  log("Thinking...", "ai");
 
-FAILED action: {ACTION}
-Error: {ERROR}
-
-ACTUAL elements on the page:
-{ELEMENTS}
-
-Return a CORRECTED action using ONLY selectors from the elements listed above.
-Format: {"actions":[<single corrected action>],"explanation":"why this selector"}`;
-
-async function callGroq(messages) {
   const res = await fetch(GROQ_ENDPOINT, {
     method: "POST",
     headers: {
@@ -112,7 +107,7 @@ async function callGroq(messages) {
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      messages,
+      messages: conversationMessages,
       temperature: 0,
       max_tokens: 1024
     })
@@ -125,257 +120,162 @@ async function callGroq(messages) {
 
   const data = await res.json();
   const raw = data.choices[0].message.content.trim();
-  log(`AI response: ${raw.substring(0, 200)}`, "ai");
-  return parseAIResponse(raw);
+  log(`AI: ${raw.substring(0, 150)}...`, "ai");
+  return parseJSON(raw);
 }
 
-function parseAIResponse(raw) {
-  // Try direct parse first
+function parseJSON(raw) {
+  // Direct parse
   try { return JSON.parse(raw); } catch (e) {}
-
-  // Try extracting from markdown code block
-  const codeBlock = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (codeBlock) {
-    try { return JSON.parse(codeBlock[1].trim()); } catch (e) {}
-  }
-
-  // Try finding JSON object in the text
-  const jsonMatch = raw.match(/\{[\s\S]*"actions"\s*:\s*\[[\s\S]*\][\s\S]*\}/);
-  if (jsonMatch) {
-    try { return JSON.parse(jsonMatch[0]); } catch (e) {}
-  }
-
-  throw new Error("Could not parse AI response as JSON");
+  // Code block
+  const block = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (block) try { return JSON.parse(block[1].trim()); } catch (e) {}
+  // Find JSON object
+  const obj = raw.match(/\{[\s\S]*"actions"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/);
+  if (obj) try { return JSON.parse(obj[0]); } catch (e) {}
+  throw new Error("AI returned invalid JSON");
 }
 
-// --- Tab helpers ---
+// ===========================================================
+// TAB HELPERS
+// ===========================================================
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) throw new Error("No active tab found");
+  if (!tab) throw new Error("No active tab");
   return tab;
 }
 
-function isProtectedUrl(url) {
+function isProtected(url) {
   if (!url) return true;
   return /^(chrome|chrome-extension|about|edge|brave|devtools):/.test(url);
 }
 
-async function waitForTabLoad(tabId, timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
+async function waitForLoad(tabId, timeout = 15000) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(fn);
       resolve();
-    }, timeoutMs);
-
-    function listener(id, info) {
+    }, timeout);
+    function fn(id, info) {
       if (id === tabId && info.status === "complete") {
-        clearTimeout(timeout);
-        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(fn);
         resolve();
       }
     }
-    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.onUpdated.addListener(fn);
   });
 }
 
-// --- Content script injection ---
-async function injectAndRun(tabId, msgType, payload) {
-  // Always inject fresh — content.js guards against double-init internally
+// ===========================================================
+// CONTENT SCRIPT BRIDGE
+// ===========================================================
+async function inject(tabId) {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"]
-    });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
   } catch (err) {
-    throw new Error(`Cannot access this page: ${err.message}`);
+    throw new Error(`Cannot access page: ${err.message}`);
   }
-
-  // Small delay for script initialization
   await sleep(100);
+}
 
+async function sendToContent(tabId, type, payload = {}) {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Content script timed out")), 8000);
-    chrome.tabs.sendMessage(tabId, { type: msgType, ...payload }, (response) => {
-      clearTimeout(timeout);
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(response || {});
-      }
+    const timer = setTimeout(() => reject(new Error("Content script timeout")), 10000);
+    chrome.tabs.sendMessage(tabId, { type, ...payload }, (resp) => {
+      clearTimeout(timer);
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(resp || {});
     });
   });
 }
 
-async function getPageContext(tabId) {
+async function readPage(tabId) {
   try {
-    const result = await injectAndRun(tabId, "getPageContext", {});
-    if (result && result.context) {
-      log(`Page context: ${result.context.length} chars`);
-      return result.context;
+    await inject(tabId);
+    const r = await sendToContent(tabId, "getPageContext");
+    if (r.context) {
+      log(`Read page (${r.context.length} chars)`, "info");
+      return r.context;
     }
   } catch (err) {
-    log(`Could not read page: ${err.message}`, "error");
+    log(`Page read failed: ${err.message}`, "error");
   }
   return null;
 }
 
-// --- Action execution ---
-async function executeAction(action, tabId) {
+// ===========================================================
+// ACTION EXECUTION
+// ===========================================================
+async function runAction(action, tabId) {
   if (stopRequested) throw new StopError();
 
-  switch (action.type) {
-    case "navigate": {
-      log(`Navigating to ${action.url}`, "action");
-      await chrome.tabs.update(tabId, { url: action.url });
-      await waitForTabLoad(tabId);
-      // Extra delay for JS-heavy pages to finish rendering
-      await sleep(1000);
-      log("Page loaded", "success");
-      return { success: true, navigated: true };
-    }
-
-    case "wait": {
-      const ms = Math.min(action.duration || 1500, 10000);
-      log(`Waiting ${ms}ms...`, "info");
-      await sleep(ms);
-      return { success: true };
-    }
-
-    case "click":
-    case "fill":
-    case "submit":
-    case "select":
-    case "check":
-    case "scroll":
-    case "getText":
-    case "pressKey": {
-      log(`${action.type}: ${action.selector || "page"} ${action.value || action.key || ""}`, "action");
-      const result = await injectAndRun(tabId, "executeAction", { action });
-      if (result.error) {
-        const err = new ElementError(result.error);
-        err.availableElements = result.availableElements || "";
-        throw err;
-      }
-      if (result.text) log(`Result: ${result.text}`, "success");
-      else log(`Done`, "success");
-      return result;
-    }
-
-    default:
-      log(`Unknown action: ${action.type}`, "error");
-      return { success: false };
+  if (action.type === "navigate") {
+    log(`Navigate: ${action.url}`, "action");
+    await chrome.tabs.update(tabId, { url: action.url });
+    await waitForLoad(tabId);
+    await sleep(1200);
+    log("Page loaded", "success");
+    return { navigated: true };
   }
+
+  if (action.type === "wait") {
+    const ms = Math.min(action.duration || 1500, 10000);
+    log(`Wait ${ms}ms`, "info");
+    await sleep(ms);
+    return {};
+  }
+
+  // DOM actions
+  const label = `${action.type}${action.selector ? ": " + action.selector : ""}${action.value ? " = " + action.value : ""}${action.key ? " [" + action.key + "]" : ""}`;
+  log(label, "action");
+
+  await inject(tabId);
+  const result = await sendToContent(tabId, "executeAction", { action });
+
+  if (result.error) {
+    const err = new ElementError(result.error);
+    err.available = result.availableElements || "";
+    throw err;
+  }
+
+  if (result.text) log(`Text: ${result.text}`, "success");
+  else log("OK", "success");
+  return result;
 }
 
-// --- Main command handler ---
-async function handleCommand(command) {
-  stopRequested = false;
-  log(`Command: "${command}"`, "cmd");
-
-  const tab = await getActiveTab();
-  log(`Tab: ${tab.url || "new tab"}`, "info");
-
-  // Phase 1: Get page context (if accessible)
-  let pageContext = null;
-  if (!isProtectedUrl(tab.url)) {
-    pageContext = await getPageContext(tab.id);
-  } else {
-    log("Protected page — skipping page read", "info");
-  }
-
-  // Phase 2: Ask AI what to do
-  log("Asking AI...", "ai");
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: buildUserPrompt(command, tab.url, pageContext) }
-  ];
-  const aiResponse = await callGroq(messages);
-
-  if (!aiResponse.actions || !Array.isArray(aiResponse.actions) || aiResponse.actions.length === 0) {
-    throw new Error("AI returned no actions");
-  }
-
-  if (aiResponse.explanation) log(`AI: ${aiResponse.explanation}`, "ai");
-  log(`${aiResponse.actions.length} action(s) to run`, "info");
-
-  // Phase 3: Execute actions
-  for (let i = 0; i < aiResponse.actions.length; i++) {
-    if (stopRequested) throw new StopError();
-
-    const action = aiResponse.actions[i];
-    const currentTab = await getActiveTab();
-
-    // Execute with retry
-    const result = await executeWithRetry(action, currentTab.id, command, messages);
-
-    // Phase 4: After navigation, ALWAYS re-read page and re-ask AI for remaining interaction actions
-    if (result.navigated && i < aiResponse.actions.length - 1) {
-      const remainingHasInteraction = aiResponse.actions.slice(i + 1).some(a =>
-        ["click", "fill", "submit", "select", "check", "getText", "pressKey"].includes(a.type)
-      );
-
-      if (remainingHasInteraction) {
-        log("Re-reading page after navigation...", "info");
-        const newTab = await getActiveTab();
-        const freshContext = isProtectedUrl(newTab.url) ? null : await getPageContext(newTab.id);
-
-        if (freshContext) {
-          log("Asking AI for updated actions with page context...", "ai");
-          const followUpMessages = [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: buildUserPrompt(
-              command,
-              newTab.url,
-              freshContext,
-              `I already navigated to ${newTab.url}. Now perform the remaining interactions on this page.`
-            )}
-          ];
-          const followUp = await callGroq(followUpMessages);
-
-          if (followUp.actions && followUp.actions.length > 0) {
-            const newActions = followUp.actions.filter(a => a.type !== "navigate");
-            // Replace all remaining actions with the AI's corrected ones
-            aiResponse.actions.splice(i + 1, Infinity, ...newActions);
-            log(`AI updated: ${newActions.length} interaction action(s)`, "ai");
-          }
-        }
-      }
-    }
-  }
-
-  log("All actions completed!", "success");
-}
-
-async function executeWithRetry(action, tabId, command, conversationHistory) {
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+async function runActionWithRetry(action, tabId, command) {
+  for (let attempt = 0; attempt <= MAX_SELECTOR_RETRIES; attempt++) {
     try {
-      return await executeAction(action, tabId);
+      return await runAction(action, tabId);
     } catch (err) {
       if (err instanceof StopError) throw err;
 
-      if (err instanceof ElementError && attempt < MAX_RETRIES) {
-        log(`Selector failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}), asking AI to fix...`, "retry");
+      if (err instanceof ElementError && attempt < MAX_SELECTOR_RETRIES) {
+        log(`Selector failed, asking AI to fix (retry ${attempt + 1})...`, "retry");
 
-        // Re-read page for fresh context
-        const currentTab = await getActiveTab();
-        const freshContext = isProtectedUrl(currentTab.url) ? null : await getPageContext(currentTab.id);
+        const tab = await getActiveTab();
+        const ctx = isProtected(tab.url) ? null : await readPage(tab.id);
 
-        const retryText = RETRY_PROMPT
-          .replace("{ACTION}", JSON.stringify(action))
-          .replace("{ERROR}", err.message)
-          .replace("{ELEMENTS}", err.availableElements || freshContext || "No elements available");
-
-        const retryMessages = [
+        const fixMessages = [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: `Original command: ${command}\nCurrent page: ${currentTab.url}\n${freshContext ? `\nPage context:\n${freshContext}\n` : ""}\n${retryText}` }
+          { role: "user", content: `Fix this failed action. Original command: "${command}"
+Page: ${tab.url}
+${ctx ? "Page elements:\n" + ctx : ""}
+
+FAILED: ${JSON.stringify(action)}
+Error: ${err.message}
+${err.available ? "Available elements:\n" + err.available : ""}
+
+Return {"actions":[<one corrected action>],"explanation":"...","done":false}` }
         ];
 
-        const corrected = await callGroq(retryMessages);
-        if (corrected.actions && corrected.actions.length > 0) {
-          action = corrected.actions[0];
-          log(`AI corrected: ${action.type} -> ${action.selector || ""}`, "ai");
+        const fix = await callGroq(fixMessages);
+        if (fix.actions?.[0]) {
+          action = fix.actions[0];
+          log(`Corrected: ${action.selector || action.type}`, "ai");
         } else {
-          throw new Error("AI could not correct the selector");
+          throw new Error("AI couldn't fix selector");
         }
       } else {
         throw err;
@@ -384,30 +284,101 @@ async function executeWithRetry(action, tabId, command, conversationHistory) {
   }
 }
 
-function buildUserPrompt(command, url, pageContext, extraInstruction) {
-  let prompt = `Command: ${command}`;
-  if (extraInstruction) prompt += `\n${extraInstruction}`;
-  prompt += `\n\nCurrent page: ${url || "new tab"}`;
-  if (pageContext) {
-    prompt += `\n\nPage elements:\n${pageContext}`;
-  } else {
-    prompt += `\n\nNo page elements available (protected page or new tab). Only return navigate actions.`;
+// ===========================================================
+// MAIN AGENTIC LOOP
+// ===========================================================
+async function handleCommand(command) {
+  stopRequested = false;
+  log(`"${command}"`, "cmd");
+
+  // Conversation history for the AI (keeps context across loop steps)
+  const conversation = [{ role: "system", content: SYSTEM_PROMPT }];
+
+  for (let step = 0; step < MAX_LOOP_STEPS; step++) {
+    if (stopRequested) throw new StopError();
+
+    // 1. Read current page state
+    const tab = await getActiveTab();
+    let pageContext = null;
+    if (!isProtected(tab.url)) {
+      pageContext = await readPage(tab.id);
+    }
+
+    // 2. Build the user message for this step
+    let stepMsg = "";
+    if (step === 0) {
+      stepMsg = `FULL COMMAND: ${command}\n\nCurrent page: ${tab.url}`;
+    } else {
+      stepMsg = `FULL COMMAND (reminder): ${command}\n\nPrevious actions completed. Current page: ${tab.url}`;
+    }
+    if (pageContext) {
+      stepMsg += `\n\nPage elements:\n${pageContext}`;
+    } else {
+      stepMsg += `\n\nNo page elements available (protected page or new tab). Only navigate actions are possible.`;
+    }
+
+    // Keep conversation concise — only system + last 4 exchanges
+    if (conversation.length > 9) {
+      const sys = conversation[0];
+      conversation.splice(1, conversation.length - 5);
+      conversation[0] = sys;
+    }
+
+    conversation.push({ role: "user", content: stepMsg });
+
+    // 3. Ask AI what to do next
+    log(`Step ${step + 1}: asking AI...`, "ai");
+    const response = await callGroq(conversation);
+
+    // Add AI response to conversation history
+    conversation.push({ role: "assistant", content: JSON.stringify(response) });
+
+    // 4. Check if AI says we're done
+    if (response.done === true) {
+      if (response.explanation) log(`AI: ${response.explanation}`, "ai");
+      log("All steps completed!", "success");
+      return;
+    }
+
+    if (!response.actions || response.actions.length === 0) {
+      log("AI returned no actions — finishing", "info");
+      return;
+    }
+
+    if (response.explanation) log(`AI: ${response.explanation}`, "ai");
+    log(`${response.actions.length} action(s) to execute`, "info");
+
+    // 5. Execute all actions in this batch
+    let navigated = false;
+    for (const action of response.actions) {
+      if (stopRequested) throw new StopError();
+
+      const currentTab = await getActiveTab();
+      const result = await runActionWithRetry(action, currentTab.id, command);
+      if (result.navigated) navigated = true;
+    }
+
+    // 6. After navigation, wait a beat then loop back to read the new page
+    if (navigated) {
+      await sleep(500);
+    }
+
+    // Small delay between loop steps to avoid hammering
+    await sleep(300);
   }
-  return prompt;
+
+  log("Reached max steps limit", "retry");
 }
 
-// --- Error types ---
+// ===========================================================
+// ERROR TYPES
+// ===========================================================
 class ElementError extends Error {
-  constructor(message) {
-    super(message);
-    this.availableElements = "";
-  }
+  constructor(msg) { super(msg); this.available = ""; }
 }
 
 class StopError extends Error {
-  constructor() { super("Stopped by user"); }
+  constructor() { super("Stopped"); }
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

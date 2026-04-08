@@ -157,9 +157,4 @@ function loadLastHistory() {
   });
 }
 
-// Also listen for one-shot messages (fallback)
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === "log") addLog(msg.text, msg.level || "info");
-});
-
 addLog("Ready. Type a command and press Enter or click Execute.", "info");
