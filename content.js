@@ -14,6 +14,15 @@
       }
       return true;
     }
+    if (msg.type === "validateSelector") {
+      try {
+        const el = document.querySelector(msg.selector);
+        sendResponse({ exists: !!el, visible: el ? isVisible(el) : false });
+      } catch (e) {
+        sendResponse({ exists: false, visible: false });
+      }
+      return true;
+    }
     if (msg.type === "executeAction") {
       runAction(msg.action)
         .then(r => sendResponse(r))
@@ -26,9 +35,7 @@
   chrome.runtime.onMessage.addListener(listener);
 
   // =========================================================
-  // PAGE CONTEXT — clean format, no quote conflicts
-  // Format: description | CSS_SELECTOR
-  // The AI copies the part after | as the CSS selector
+  // PAGE CONTEXT
   // =========================================================
   function extractPageContext() {
     const lines = [];
@@ -37,7 +44,7 @@
     lines.push("ELEMENTS (use the value after | as your CSS selector):");
 
     const INTERACTIVE = [
-      "a[href]", "button", "input", "textarea", "select",
+      "a[href]", "button", "input:not([type='hidden'])", "textarea", "select",
       "[role='button']", "[role='link']", "[role='tab']", "[role='menuitem']",
       "[role='search']", "[role='textbox']", "[role='combobox']",
       "[contenteditable='true']", "[onclick]",
@@ -50,7 +57,7 @@
 
     for (const el of all) {
       if (totalLen > 7000) break;
-      if (!isVisible(el) && !(el.tagName === "INPUT" && el.type === "hidden")) continue;
+      if (!isVisible(el)) continue;
 
       const selector = buildSelector(el);
       if (!selector || seen.has(selector)) continue;
@@ -72,12 +79,13 @@
   }
 
   function isVisible(el) {
-    if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === "hidden" || style.visibility === "collapse") return false;
+    if (el.offsetParent === null && style.position !== "fixed" && style.position !== "sticky") return false;
     const r = el.getBoundingClientRect();
     return r.width > 0 || r.height > 0;
   }
 
-  // Build a human-readable description of the element
   function buildDescription(el, tag) {
     const parts = [tag];
     if (el.type && (tag === "input" || tag === "button")) parts.push(`type="${el.type}"`);
@@ -97,65 +105,59 @@
     return parts.join(" ");
   }
 
-  // Build a unique CSS selector — NO CSS.escape on attribute values
-  // CSS.escape only needed for IDs (which can start with digits etc.)
+  // Escape double quotes in attribute values for CSS selectors
+  function escAttr(val) {
+    return val.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
   function buildSelector(el) {
     if (el.id) return `#${CSS.escape(el.id)}`;
 
     const tag = el.tagName.toLowerCase();
 
-    // name attribute (for inputs)
     if (el.name && (tag === "input" || tag === "textarea" || tag === "select")) {
-      const sel = `${tag}[name="${el.name}"]`;
+      const sel = `${tag}[name="${escAttr(el.name)}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // aria-label
     const aria = el.getAttribute("aria-label");
     if (aria) {
-      const sel = `[aria-label="${aria}"]`;
+      const sel = `[aria-label="${escAttr(aria)}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // data-testid
     const testId = el.getAttribute("data-testid");
     if (testId) {
-      const sel = `[data-testid="${testId}"]`;
+      const sel = `[data-testid="${escAttr(testId)}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // placeholder
     if (el.placeholder) {
-      const sel = `${tag}[placeholder="${el.placeholder}"]`;
+      const sel = `${tag}[placeholder="${escAttr(el.placeholder)}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // type for inputs
     if (tag === "input" && el.type) {
       const sel = `input[type="${el.type}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // role
     const role = el.getAttribute("role");
     if (role) {
       const sel = `[role="${role}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // value for submit buttons
     if (tag === "input" && el.value) {
-      const sel = `input[value="${el.value}"]`;
+      const sel = `input[value="${escAttr(el.value)}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // button type
     if (tag === "button" && el.type) {
       const sel = `button[type="${el.type}"]`;
       if (isUnique(sel)) return sel;
     }
 
-    // Path-based fallback
     return buildPathSelector(el);
   }
 
@@ -218,10 +220,10 @@
       } catch (e) {}
     }
 
-    // Fuzzy text fallback
+    // Fuzzy text fallback — only for clickable elements, require meaningful hint
     if (action.selector) {
       const hint = action.selector.replace(/[[\](){}='"~^$*>+#.:,\\]/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
-      if (hint.length > 1) {
+      if (hint.length >= 3) {
         const all = document.querySelectorAll("a, button, [role='button'], [role='link'], input[type='submit'], input[type='button']");
         for (const el of all) {
           if (!isVisible(el)) continue;
@@ -248,6 +250,7 @@
     for (const el of els) {
       if (!isVisible(el)) continue;
       const sel = buildSelector(el);
+      if (!sel) continue;
       const tag = el.tagName.toLowerCase();
       const text = (el.textContent || el.value || el.placeholder || el.getAttribute("aria-label") || "").trim().substring(0, 40);
       lines.push(`${tag} "${text}" | ${sel}`);
@@ -261,6 +264,8 @@
     if (!el) return notFound(action);
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     await sleep(200);
+    if (el.focus) el.focus();
+    el.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
     el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     el.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
@@ -273,6 +278,7 @@
     const el = findEl(action);
     if (!el) return notFound(action);
     el.scrollIntoView({ behavior: "smooth", block: "center" });
+    await sleep(100);
     el.focus();
     el.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
     el.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
@@ -306,6 +312,7 @@
   async function doPressKey(action) {
     const el = action.selector ? findEl(action) : document.activeElement;
     if (!el) return notFound(action);
+    if (el.focus) el.focus();
     const key = action.key || "Enter";
     const keyCode = key === "Enter" ? 13 : key === "Tab" ? 9 : key === "Escape" ? 27 : 0;
     el.dispatchEvent(new KeyboardEvent("keydown", { key, keyCode, bubbles: true, cancelable: true }));

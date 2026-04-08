@@ -4,14 +4,14 @@ const API_KEY = atob(_k.join(""));
 const API_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const API_MODEL = "gpt-4o";
 
-const MAX_STEPS = 20;
-const MAX_RETRIES = 2;
+const MAX_STEPS = 25;
 
 // --- State ---
 let stopRequested = false;
+let isRunning = false;
 let popupPort = null;
 
-// --- Logging: "status" shown in popup, "debug" console only ---
+// --- Logging ---
 function log(msg, level = "debug") {
   console.log(`[BG] ${msg}`);
   if (level !== "debug" && popupPort) {
@@ -37,7 +37,7 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => { popupPort = null; });
 });
 
-// Fallback
+// Fallback for when port is not connected
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return;
   if (msg.type === "execute" && !popupPort) {
@@ -55,60 +55,58 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 const SYS = `You are a browser automation agent running in a LOOP.
 
 HOW THE LOOP WORKS:
-1. You receive the user's command and the current page state
-2. You return 1-4 actions to execute RIGHT NOW
-3. Those actions get executed
-4. You are called AGAIN with the NEW page state
-5. You return the NEXT actions
+1. You receive the user's command + current page elements + results of your last actions
+2. You return 1-3 actions to execute RIGHT NOW
+3. Those actions get executed and you see results (OK or FAILED)
+4. You are called AGAIN with fresh page state + action results
+5. You analyze what worked, what failed, and return the NEXT actions
 6. This repeats until the ENTIRE command is done
 
-RESPONSE FORMAT — raw JSON only, NO markdown, NO code blocks, NO backticks:
+RESPONSE FORMAT — raw JSON only, NO markdown, NO code blocks:
 {"actions":[...],"done":false}
 
-CRITICAL RULES FOR "done":
-- "done":false means "I have more steps to do after these actions complete"
-- "done":true means "the user's ENTIRE command is 100% finished, every single part"
-- After a navigate action, ALWAYS return "done":false — you haven't seen the new page yet
-- If the command says "go to X AND do Y", done is false until Y is also completed
-- If the command has multiple parts (login, fill form, go somewhere), done is false until ALL parts are finished
-- Only return "done":true with an empty actions array when everything is complete
+RULES FOR "done":
+- "done":false = more steps remain
+- "done":true = the user's ENTIRE command is 100% finished
+- After navigate, ALWAYS return "done":false — you haven't seen the new page yet
+- Multi-part commands (go to X AND do Y) are not done until ALL parts complete
 
 ACTION TYPES:
 {"type":"navigate","url":"https://..."}
-{"type":"click","selector":"css selector"}
-{"type":"fill","selector":"css selector","value":"text"}
-{"type":"pressKey","selector":"css selector","key":"Enter"}
-{"type":"submit","selector":"css selector"}
-{"type":"select","selector":"css selector","value":"option"}
-{"type":"check","selector":"css selector","checked":true}
+{"type":"click","selector":"CSS selector"}
+{"type":"fill","selector":"CSS selector","value":"text"}
+{"type":"pressKey","selector":"CSS selector","key":"Enter"}
+{"type":"submit","selector":"CSS selector"}
+{"type":"select","selector":"CSS selector","value":"option value"}
+{"type":"check","selector":"CSS selector","checked":true}
 {"type":"scroll","direction":"down","amount":500}
 {"type":"wait","duration":1500}
-{"type":"getText","selector":"css selector"}
 
-SELECTOR RULES (CRITICAL — violations cause failures):
-- Page elements are listed as: description "visible text" | CSS_SELECTOR
-- The part after | is the CSS selector. Copy it EXACTLY into your action's "selector" field.
-- NEVER make up selectors. NEVER use selectors from your training data.
-- If you can't find a matching element, return a wait action instead.
-- Every website is different.
+SELECTOR RULES (CRITICAL):
+- Page elements are shown as: description "visible text" | CSS_SELECTOR
+- The part after | is the EXACT CSS selector to use. Copy it as-is.
+- NEVER invent selectors. NEVER guess. Only use what appears after |.
+- If no matching element exists, use wait or scroll to find it.
+
+ERROR RECOVERY:
+- If you see "FAILED:" in results, your action did not work.
+- Read the error message and the CURRENT page elements to understand why.
+- Pick a DIFFERENT selector from the available elements — do not repeat the same failed selector.
+- If an element is not found, it may not be visible yet — try scroll or wait first.
+- Common causes: page changed after your action, element is below the fold, field only appears after a previous step.
 
 BEHAVIOR:
-- After navigate, STOP and return "done":false. You'll get the new page next call.
-- For search: fill the search box, then pressKey Enter on it.
-- Every website is different. Read the ELEMENTS list carefully to find login forms, signup buttons, search boxes, etc. Never assume a site's structure — always use what you see.
-- For login/signup: scan ALL elements for email/username/password inputs and submit buttons. Different sites use different field names, labels, and layouts.
-- When no page elements are shown, only navigate actions are possible.
+- After navigate: STOP, return done:false. Wait for new page.
+- Every website is different. Read ALL elements to find login forms, inputs, buttons. Never assume layout.
+- For login: find email/username input, fill it, find password input, fill it, find submit button, click it. These might appear across multiple steps.
+- For search: fill the search box, then pressKey Enter.
 
-EXAMPLES — the selector ALWAYS comes from after the | in the page elements:
-
+EXAMPLES:
 Page element: input type="text" name="user" placeholder="Username" | input[name="user"]
-Correct action: {"type":"fill","selector":"input[name=\\"user\\"]","value":"myuser"}
+Correct: {"type":"fill","selector":"input[name=\\"user\\"]","value":"myuser"}
 
 Page element: button "Log In" | #login-btn
-Correct action: {"type":"click","selector":"#login-btn"}
-
-Page element: a href="/signup" "Create Account" | a[href="/signup"]
-Correct action: {"type":"click","selector":"a[href=\\"/signup\\"]"}`;
+Correct: {"type":"click","selector":"#login-btn"}`;
 
 async function callAI(messages) {
   log("AI call...");
@@ -150,6 +148,11 @@ function isProtected(url) {
 }
 
 async function waitLoad(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "complete") return;
+  } catch (e) {}
+
   return new Promise(resolve => {
     const t = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve(); }, 15000);
     function fn(id, info) {
@@ -177,8 +180,7 @@ async function sendMsg(tabId, type, payload = {}) {
 }
 
 async function readPage(tabId) {
-  // Try up to 2 times in case page isn't ready yet
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       await inject(tabId);
       const r = await sendMsg(tabId, "getPageContext");
@@ -189,14 +191,13 @@ async function readPage(tabId) {
     } catch (e) {
       log(`Read attempt ${attempt + 1} failed: ${e.message}`);
     }
-    // Wait before retry — page might still be loading
-    await sleep(1500);
+    await sleep(1000 + attempt * 500);
   }
   return null;
 }
 
 // ===========================================================
-// ACTION EXECUTION
+// ACTION EXECUTION — simple, no retries. AI handles errors.
 // ===========================================================
 async function runAction(action, tabId) {
   if (stopRequested) throw new StopError();
@@ -206,194 +207,161 @@ async function runAction(action, tabId) {
     await chrome.tabs.update(tabId, { url: action.url });
     await waitLoad(tabId);
     await sleep(1500);
-    return { navigated: true };
+    return "navigated";
   }
   if (action.type === "wait") {
     await sleep(Math.min(action.duration || 1500, 10000));
-    return {};
+    return "waited";
   }
 
   log(`${action.type}: ${action.selector || ""}`);
   await inject(tabId);
   const result = await sendMsg(tabId, "executeAction", { action });
   if (result.error) {
-    const err = new ElementError(result.error);
-    err.available = result.availableElements || "";
-    throw err;
+    // Return error info — AI will see this and correct
+    let msg = result.error;
+    if (result.availableElements) msg += "\nAvailable elements on page:\n" + result.availableElements;
+    throw new Error(msg);
   }
-  return result;
-}
-
-async function runWithRetry(action, tabId, command) {
-  for (let i = 0; i <= MAX_RETRIES; i++) {
-    try {
-      return await runAction(action, tabId);
-    } catch (err) {
-      if (err instanceof StopError) throw err;
-      if (err instanceof ElementError && i < MAX_RETRIES) {
-        log(`Retry ${i + 1}...`);
-        const tab = await getTab();
-        const ctx = isProtected(tab.url) ? null : await readPage(tab.id);
-        const fix = await callAI([
-          { role: "system", content: SYS },
-          { role: "user", content: `Your selector FAILED. Use the selector after the | character from the elements below.\n\nCommand:"${command}"\nPage:${tab.url}\n${ctx || ""}\n\nFailed: ${JSON.stringify(action)}\nError: ${err.message}\n${err.available ? "Available:\n" + err.available : ""}\n\nReturn {"actions":[corrected action],"done":false}` }
-        ]);
-        if (fix.actions?.[0]) { action = fix.actions[0]; }
-        else throw new Error("AI can't fix selector");
-      } else throw err;
-    }
-  }
+  return result.text ? `got text: "${result.text.substring(0, 200)}"` : "ok";
 }
 
 // ===========================================================
-// MAIN LOOP
+// MAIN LOOP — AI-driven. Errors go back to AI, not retried programmatically.
 // ===========================================================
-
-// Check if a command likely has multiple parts
 function isMultiPart(cmd) {
-  const lower = cmd.toLowerCase();
-  return /\band\b|\bthen\b|\bafter\b|\balso\b|,/.test(lower);
+  return /\band\b|\bthen\b|\bafter\b|\balso\b|,/i.test(cmd);
 }
 
 async function handleCommand(command) {
+  if (isRunning) throw new Error("Already running a command");
+  isRunning = true;
   stopRequested = false;
-  log(command, "status");
 
-  const conv = [{ role: "system", content: SYS }];
-  let totalActions = 0;
-  let lastUrl = "";
-  let lastCtxHash = "";
-  let didNavigate = false;
-  let stuckCount = 0;
+  try {
+    log(command, "status");
 
-  for (let step = 0; step < MAX_STEPS; step++) {
-    if (stopRequested) throw new StopError();
+    // Lock onto the current tab
+    const startTab = await getTab();
+    const tabId = startTab.id;
 
-    // 1. Read current page
-    const tab = await getTab();
-    let ctx = null;
-    if (!isProtected(tab.url)) {
-      ctx = await readPage(tab.id);
-    }
+    const conv = [{ role: "system", content: SYS }];
+    let totalActions = 0;
+    let lastUrl = "";
+    let lastCtxHash = "";
+    let stuckCount = 0;
+    let actionResults = null;
 
-    // Detect if we're stuck — compare URL AND page content, not just URL
-    // A login page can stay on the same URL but change content (email → password step)
-    const ctxHash = ctx ? ctx.substring(0, 500) : "";
-    if (tab.url === lastUrl && ctxHash === lastCtxHash && step > 0 && !didNavigate) {
-      stuckCount++;
-      if (stuckCount >= 4) {
-        log("Stuck — no progress after 4 attempts", "error");
+    for (let step = 0; step < MAX_STEPS; step++) {
+      if (stopRequested) throw new StopError();
+
+      // Get current state of our locked tab
+      let tab;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch (e) {
+        throw new Error("Tab was closed");
+      }
+
+      let ctx = null;
+      if (!isProtected(tab.url)) {
+        ctx = await readPage(tabId);
+      }
+
+      // Stuck detection — both URL AND content must be unchanged
+      const ctxHash = ctx ? ctx.substring(0, 500) : "";
+      if (tab.url === lastUrl && ctxHash === lastCtxHash && step > 0) {
+        stuckCount++;
+        if (stuckCount >= 5) {
+          log("Stuck — no progress after 5 attempts", "error");
+          return;
+        }
+      } else {
+        stuckCount = 0;
+      }
+      lastUrl = tab.url;
+      lastCtxHash = ctxHash;
+
+      // Build message — include action results so AI knows what worked/failed
+      let m = `Command: ${command}\nPage: ${tab.url}`;
+
+      if (actionResults) {
+        m += `\n\nResults of your last actions:\n${actionResults}`;
+        actionResults = null;
+      } else if (step > 0) {
+        m += `\nStep ${step + 1}. Continue with the remaining parts of the command.`;
+      }
+
+      if (ctx) {
+        m += `\n\n${ctx}\n\nUse the CSS selector after | for each element. Do NOT invent selectors.`;
+      } else {
+        m += `\n\nNo page elements available (page may still be loading). Use navigate or wait.`;
+      }
+
+      // Keep system + last 10 messages for context
+      while (conv.length > 11) conv.splice(1, 1);
+      conv.push({ role: "user", content: m });
+
+      // Call AI
+      const resp = await callAI(conv);
+      conv.push({ role: "assistant", content: JSON.stringify(resp) });
+
+      const actions = resp.actions || [];
+
+      // Done check
+      if (resp.done === true && actions.length === 0) {
+        if (step <= 1 && isMultiPart(command) && totalActions <= 1) {
+          log("AI tried to stop early — continuing...");
+          conv[conv.length - 1] = { role: "assistant", content: JSON.stringify({ actions: [], done: false }) };
+          conv.push({ role: "user", content: `Not done yet. Full command: "${command}". Continue.` });
+          continue;
+        }
+        log("Task completed", "success");
         return;
       }
-    } else {
-      stuckCount = 0;
-    }
-    lastUrl = tab.url;
-    lastCtxHash = ctxHash;
-    didNavigate = false;
 
-    // 2. Build message
-    let m = `Command: ${command}\nCurrent page: ${tab.url}`;
-    if (step > 0) m += `\nStep ${step + 1}. Previous actions completed. Continue with the remaining parts of the command.`;
-    if (ctx) {
-      m += `\n\n${ctx}\n\nUse the CSS selector after the | character for each element. Do NOT invent selectors.`;
-    } else {
-      m += `\n\nNo page elements available. Only navigate actions are possible.`;
-    }
-
-    // Trim conversation — keep system + last 3 exchanges
-    while (conv.length > 7) conv.splice(1, 2);
-    conv.push({ role: "user", content: m });
-
-    // 3. Call AI
-    const resp = await callAI(conv);
-    conv.push({ role: "assistant", content: JSON.stringify(resp) });
-
-    // 4. Check done — but protect against premature done
-    const actions = resp.actions || [];
-
-    if (resp.done === true && actions.length === 0) {
-      // Safety: if this is step 0 or 1 and the command has multiple parts,
-      // the AI probably quit too early — force continue
-      if (step <= 1 && isMultiPart(command) && totalActions <= 1) {
-        log("AI tried to stop early — continuing...");
-        // Replace the done response in conversation so AI sees it should keep going
-        conv[conv.length - 1] = {
-          role: "assistant",
-          content: JSON.stringify({ actions: [], done: false })
-        };
-        conv.push({
-          role: "user",
-          content: `No, the command is NOT done yet. The full command is: "${command}". You only completed the first part. Continue with the remaining steps. Look at the current page and decide what to do next.`
-        });
+      if (actions.length === 0) {
+        conv.push({ role: "user", content: `No actions returned. Command: "${command}". What are the next steps?` });
         continue;
       }
 
-      log("Task completed", "success");
-      return;
-    }
+      totalActions += actions.length;
+      log(`Working... (${totalActions} actions done)`, "status");
 
-    if (actions.length === 0) {
-      // No actions but done is false — AI is confused, nudge it
-      conv.push({
-        role: "user",
-        content: `You returned no actions but the task is not done. The command is: "${command}". Look at the page elements and return the next actions.`
-      });
-      continue;
-    }
+      // Execute actions — collect results for AI feedback
+      const results = [];
+      let didNavigate = false;
 
-    totalActions += actions.length;
-    log(`Working... (${totalActions} actions done)`, "status");
+      for (const action of actions) {
+        if (stopRequested) throw new StopError();
 
-    // 5. Execute all actions in this batch
-    for (let action of actions) {
-      if (stopRequested) throw new StopError();
-
-      // Pre-validate: check if AI's selector is in the page context
-      if (action.selector && ctx) {
-        // Extract all selectors from "| SELECTOR" format
-        const validSelectors = ctx.split("\n")
-          .map(line => { const i = line.lastIndexOf(" | "); return i >= 0 ? line.substring(i + 3).trim() : null; })
-          .filter(Boolean);
-
-        const selectorMatch = validSelectors.some(vs =>
-          vs === action.selector ||
-          action.selector.includes(vs) ||
-          vs.includes(action.selector)
-        );
-
-        if (!selectorMatch && validSelectors.length > 0) {
-          log(`AI used wrong selector "${action.selector}" — asking for correction`);
-          const t2 = await getTab();
-          const freshCtx = isProtected(t2.url) ? null : await readPage(t2.id);
-          const fixResp = await callAI([
-            { role: "system", content: SYS },
-            { role: "user", content: `Your selector "${action.selector}" does NOT exist on this page.\n\nCommand: ${command}\nPage: ${t2.url}\n\n${freshCtx || ctx}\n\nOriginal action: ${JSON.stringify(action)}\nReturn {"actions":[corrected action using a selector from the elements above (after the | character)],"done":false}` }
-          ]);
-          if (fixResp.actions?.[0]) {
-            action = fixResp.actions[0];
-            log(`Corrected to: ${action.selector}`);
-          }
+        try {
+          const r = await runAction(action, tabId);
+          if (r === "navigated") didNavigate = true;
+          results.push(`OK: ${action.type} ${action.selector || action.url || ""} — ${r}`);
+        } catch (err) {
+          if (err instanceof StopError) throw err;
+          results.push(`FAILED: ${action.type} ${action.selector || ""} — ${err.message}`);
+          break; // Stop batch — AI will see the error and decide what to do next
         }
+
+        // Wait after fill/click for page to react
+        if (action.type === "fill" || action.type === "click") await sleep(800);
       }
 
-      const t = await getTab();
-      const r = await runWithRetry(action, t.id, command);
-      if (r.navigated) didNavigate = true;
+      // Store results — AI sees these on next iteration
+      actionResults = results.join("\n");
 
-      // Wait after fill/click so the page can react (reveal next field, enable buttons)
-      if (action.type === "fill" || action.type === "click") await sleep(800);
+      if (didNavigate) await sleep(1500);
+      await sleep(500);
     }
 
-    // 6. Wait for page to settle
-    if (didNavigate) await sleep(1500);
-    await sleep(500);
+    log("Reached step limit", "error");
+  } finally {
+    isRunning = false;
   }
-
-  log("Reached step limit", "error");
 }
 
 // ===========================================================
-class ElementError extends Error { constructor(m) { super(m); this.available = ""; } }
 class StopError extends Error { constructor() { super("Stopped"); } }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

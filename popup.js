@@ -9,9 +9,20 @@ const statusText = document.getElementById("statusText");
 
 let running = false;
 let port = null;
+let reconnectAttempts = 0;
 
 function connectPort() {
-  port = chrome.runtime.connect({ name: "popup" });
+  if (reconnectAttempts >= 10) return;
+
+  try {
+    port = chrome.runtime.connect({ name: "popup" });
+  } catch (e) {
+    reconnectAttempts++;
+    return;
+  }
+
+  reconnectAttempts = 0;
+
   port.onMessage.addListener((msg) => {
     if (msg.type === "log") addLog(msg.text, msg.level);
     if (msg.type === "done") {
@@ -22,7 +33,9 @@ function connectPort() {
   });
   port.onDisconnect.addListener(() => {
     port = null;
-    setTimeout(() => { if (!port) connectPort(); }, 500);
+    reconnectAttempts++;
+    const delay = Math.min(500 * reconnectAttempts, 5000);
+    setTimeout(() => { if (!port) connectPort(); }, delay);
   });
 }
 connectPort();
@@ -70,6 +83,9 @@ function setRunning(isRunning, reason) {
 function executeCommand() {
   const command = commandInput.value.trim();
   if (!command || running) return;
+
+  // Reset reconnect counter on user action so port stays alive
+  reconnectAttempts = 0;
 
   addLog(`> ${command}`, "cmd");
   saveHistory(command);
