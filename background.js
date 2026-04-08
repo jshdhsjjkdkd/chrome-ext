@@ -238,12 +238,22 @@ async function runWithRetry(action, tabId, command) {
 // ===========================================================
 // MAIN LOOP
 // ===========================================================
+
+// Check if a command likely has multiple parts
+function isMultiPart(cmd) {
+  const lower = cmd.toLowerCase();
+  return /\band\b|\bthen\b|\bafter\b|\balso\b|,/.test(lower);
+}
+
 async function handleCommand(command) {
   stopRequested = false;
   log(command, "status");
 
   const conv = [{ role: "system", content: SYS }];
   let totalActions = 0;
+  let lastUrl = "";
+  let didNavigate = false;
+  let stuckCount = 0;
 
   for (let step = 0; step < MAX_STEPS; step++) {
     if (stopRequested) throw new StopError();
@@ -255,50 +265,82 @@ async function handleCommand(command) {
       ctx = await readPage(tab.id);
     }
 
-    // 2. Build message — always include full command
+    // Detect if we're stuck on the same page with no progress
+    if (tab.url === lastUrl && step > 0 && !didNavigate) {
+      stuckCount++;
+      if (stuckCount >= 3) {
+        log("Stuck — no progress after 3 attempts", "error");
+        return;
+      }
+    } else {
+      stuckCount = 0;
+    }
+    lastUrl = tab.url;
+    didNavigate = false;
+
+    // 2. Build message
     let m = `Command: ${command}\nCurrent page: ${tab.url}`;
-    if (step > 0) m += `\nPrevious actions were executed successfully. What's next?`;
+    if (step > 0) m += `\nStep ${step + 1}. Previous actions completed. Continue with the remaining parts of the command.`;
     if (ctx) {
       m += `\n\nPage elements:\n${ctx}`;
     } else {
       m += `\n\nNo page elements available. Only navigate actions are possible.`;
     }
 
-    // Keep conversation tight — system + last 3 exchanges
+    // Trim conversation — keep system + last 3 exchanges
     while (conv.length > 7) conv.splice(1, 2);
-
     conv.push({ role: "user", content: m });
 
     // 3. Call AI
     const resp = await callAI(conv);
     conv.push({ role: "assistant", content: JSON.stringify(resp) });
 
-    // 4. Check done
-    if (resp.done === true && (!resp.actions || resp.actions.length === 0)) {
+    // 4. Check done — but protect against premature done
+    const actions = resp.actions || [];
+
+    if (resp.done === true && actions.length === 0) {
+      // Safety: if this is step 0 or 1 and the command has multiple parts,
+      // the AI probably quit too early — force continue
+      if (step <= 1 && isMultiPart(command) && totalActions <= 1) {
+        log("AI tried to stop early — continuing...");
+        // Replace the done response in conversation so AI sees it should keep going
+        conv[conv.length - 1] = {
+          role: "assistant",
+          content: JSON.stringify({ actions: [], done: false })
+        };
+        conv.push({
+          role: "user",
+          content: `No, the command is NOT done yet. The full command is: "${command}". You only completed the first part. Continue with the remaining steps. Look at the current page and decide what to do next.`
+        });
+        continue;
+      }
+
       log("Task completed", "success");
       return;
     }
 
-    const actions = resp.actions || [];
     if (actions.length === 0) {
-      log("Task completed", "success");
-      return;
+      // No actions but done is false — AI is confused, nudge it
+      conv.push({
+        role: "user",
+        content: `You returned no actions but the task is not done. The command is: "${command}". Look at the page elements and return the next actions.`
+      });
+      continue;
     }
 
     totalActions += actions.length;
-    log(`Working... (${totalActions} actions)`, "status");
+    log(`Working... (${totalActions} actions done)`, "status");
 
-    // 5. Execute
-    let navigated = false;
+    // 5. Execute all actions in this batch
     for (const action of actions) {
       if (stopRequested) throw new StopError();
       const t = await getTab();
       const r = await runWithRetry(action, t.id, command);
-      if (r.navigated) navigated = true;
+      if (r.navigated) didNavigate = true;
     }
 
-    // 6. After navigation, extra wait for page to settle
-    if (navigated) await sleep(800);
+    // 6. Wait for page to settle
+    if (didNavigate) await sleep(1000);
     await sleep(300);
   }
 

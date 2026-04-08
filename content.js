@@ -1,14 +1,17 @@
 // Content script — injected dynamically by background.js
 (function() {
-  if (window.__aiTaskAutomator) return;
-  window.__aiTaskAutomator = true;
+  // Always remove old listener before adding new one
+  // This ensures the script works even after re-injection
+  if (window.__aiTaskAutomatorFn) {
+    try { chrome.runtime.onMessage.removeListener(window.__aiTaskAutomatorFn); } catch (e) {}
+  }
 
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  function listener(msg, sender, sendResponse) {
     if (msg.type === "getPageContext") {
       try {
         sendResponse({ context: extractPageContext() });
       } catch (err) {
-        sendResponse({ context: `<title>${document.title}</title>`, error: err.message });
+        sendResponse({ context: `TITLE:${document.title}\nURL:${location.href}`, error: err.message });
       }
       return true;
     }
@@ -19,7 +22,10 @@
         .catch(e => sendResponse({ error: e.message }));
       return true;
     }
-  });
+  }
+
+  window.__aiTaskAutomatorFn = listener;
+  chrome.runtime.onMessage.addListener(listener);
 
   // =========================================================
   // PAGE CONTEXT EXTRACTION
