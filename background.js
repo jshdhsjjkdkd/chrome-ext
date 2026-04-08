@@ -85,20 +85,22 @@ ACTION TYPES:
 {"type":"wait","duration":1500}
 {"type":"getText","selector":"css selector"}
 
-SELECTOR RULES:
-- Each page element has a sel="..." attribute. Use that EXACT value as your CSS selector.
-- NEVER invent or guess selectors. Only use what you see in the page elements.
+SELECTOR RULES (CRITICAL — violations cause failures):
+- Page elements are listed with sel="..." attributes. You MUST copy that EXACT sel value as your CSS selector.
+- NEVER use selectors from memory or training data. NEVER guess selectors like input[name='loginfmt'] or #email.
+- If you cannot find a matching element in the provided page elements, return a wait action instead.
+- Every website is different. The same site may have completely different selectors than you expect.
 
 BEHAVIOR:
 - After navigate, STOP and return "done":false. You'll get the new page next call.
 - For search: fill the search box, then pressKey Enter on it.
-- For login: fill username/email, fill password, click the login/submit button.
+- For login: look at the page elements for ANY input field (email, username, text) and ANY password field. Use their sel values.
 - When no page elements are shown, only navigate actions are possible.
 
-EXAMPLE LOOP for "go to youtube and search for cats":
-Call 1 → {"actions":[{"type":"navigate","url":"https://www.youtube.com"}],"done":false}
-Call 2 (sees youtube page) → {"actions":[{"type":"fill","selector":"input#search","value":"cats"},{"type":"pressKey","selector":"input#search","key":"Enter"}],"done":false}
-Call 3 (sees search results) → {"actions":[],"done":true}`;
+EXAMPLE — notice how selectors come from the page elements, NOT from memory:
+Page elements include: <input type="email" sel="#i0116" placeholder="Email"/>
+Correct: {"type":"fill","selector":"#i0116","value":"user@mail.com"}
+WRONG: {"type":"fill","selector":"input[name='loginfmt']","value":"user@mail.com"}`;
 
 async function callAI(messages) {
   log("AI call...");
@@ -226,7 +228,7 @@ async function runWithRetry(action, tabId, command) {
         const ctx = isProtected(tab.url) ? null : await readPage(tab.id);
         const fix = await callAI([
           { role: "system", content: SYS },
-          { role: "user", content: `Fix failed action. Command:"${command}" Page:${tab.url}\n${ctx ? "Page elements:\n" + ctx : ""}\nFailed:${JSON.stringify(action)} Error:${err.message}\n${err.available ? "Available elements:\n" + err.available : ""}\nReturn {"actions":[corrected action],"done":false}` }
+          { role: "user", content: `Your selector FAILED because it does not exist on this page. Do NOT guess selectors — use ONLY sel="..." values from the elements below.\n\nCommand:"${command}"\nPage:${tab.url}\n${ctx ? "=== PAGE ELEMENTS ===\n" + ctx + "\n=== END ===" : ""}\n\nFailed: ${JSON.stringify(action)}\nError: ${err.message}\n${err.available ? "Available elements on page:\n" + err.available : ""}\n\nPick the correct element from above and return {"actions":[corrected action],"done":false}` }
         ]);
         if (fix.actions?.[0]) { action = fix.actions[0]; }
         else throw new Error("AI can't fix selector");
@@ -282,7 +284,7 @@ async function handleCommand(command) {
     let m = `Command: ${command}\nCurrent page: ${tab.url}`;
     if (step > 0) m += `\nStep ${step + 1}. Previous actions completed. Continue with the remaining parts of the command.`;
     if (ctx) {
-      m += `\n\nPage elements:\n${ctx}`;
+      m += `\n\n=== PAGE ELEMENTS (use sel="..." values as CSS selectors) ===\n${ctx}\n=== END PAGE ELEMENTS ===\n\nIMPORTANT: For your actions, copy the EXACT sel="..." value from above as the "selector". Do NOT invent selectors.`;
     } else {
       m += `\n\nNo page elements available. Only navigate actions are possible.`;
     }
@@ -332,8 +334,25 @@ async function handleCommand(command) {
     log(`Working... (${totalActions} actions done)`, "status");
 
     // 5. Execute all actions in this batch
-    for (const action of actions) {
+    for (let action of actions) {
       if (stopRequested) throw new StopError();
+
+      // Pre-validate: if the selector doesn't appear in page context, reject immediately
+      if (action.selector && ctx && !ctx.includes(action.selector)) {
+        log(`AI used wrong selector "${action.selector}" — not in page elements, asking for correction`);
+        // Ask AI to fix using a fresh copy of the page context
+        const t2 = await getTab();
+        const freshCtx = isProtected(t2.url) ? null : await readPage(t2.id);
+        const fixResp = await callAI([
+          { role: "system", content: SYS },
+          { role: "user", content: `Your selector "${action.selector}" does NOT exist on this page. You MUST use a sel="..." value from the page elements below.\n\nCommand: ${command}\nPage: ${t2.url}\n\n=== PAGE ELEMENTS ===\n${freshCtx || ctx}\n=== END ===\n\nOriginal action: ${JSON.stringify(action)}\nReturn {"actions":[corrected action with a selector FROM the page elements above],"done":false}` }
+        ]);
+        if (fixResp.actions?.[0]) {
+          action = fixResp.actions[0];
+          log(`Corrected to: ${action.selector}`);
+        }
+      }
+
       const t = await getTab();
       const r = await runWithRetry(action, t.id, command);
       if (r.navigated) didNavigate = true;
