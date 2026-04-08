@@ -6,6 +6,13 @@ const GROQ_MODEL_FAST = "llama-3.1-8b-instant";
 
 let stopRequested = false;
 
+class ElementNotFoundError extends Error {
+  constructor(message, availableElements) {
+    super(message);
+    this.availableElements = availableElements;
+  }
+}
+
 function log(msg) {
   console.log(`[BG] ${msg}`);
   chrome.runtime.sendMessage({ type: "log", text: msg }).catch(() => {});
@@ -114,11 +121,12 @@ async function injectContentScript(tabId) {
 async function getPageHtml(tabId) {
   try {
     await injectContentScript(tabId);
+    // Small delay to let page settle after navigation
+    await new Promise(r => setTimeout(r, 500));
     const results = await chrome.tabs.sendMessage(tabId, { type: "getHTML" });
     if (results && results.html) {
-      const truncated = results.html.substring(0, 8000);
-      log(`Got page HTML (${truncated.length} chars)`);
-      return truncated;
+      log(`Got page structure (${results.html.length} chars)`);
+      return results.html;
     }
   } catch (err) {
     log(`Failed to get page HTML: ${err.message}`);
@@ -175,7 +183,8 @@ async function executeAction(action, tabId) {
         action: action
       });
       if (result && result.error) {
-        throw new Error(result.error);
+        // Element not found — return error info for retry logic
+        throw new ElementNotFoundError(result.error, result.availableElements || "");
       }
       if (result && result.text) {
         log(`getText result: ${result.text}`);
@@ -226,19 +235,87 @@ async function handleCommand(command) {
     log(`AI explanation: ${aiResponse.explanation || "none"}`);
     log(`Got ${aiResponse.actions.length} action(s) to execute`);
 
-    // Execute each action sequentially
+    // If AI returned actions without HTML but some actions need page interaction,
+    // check if there's a navigate first — we'll re-read HTML after it
+    const hasNavigate = aiResponse.actions.some(a => a.type === "navigate");
+    const hasInteraction = aiResponse.actions.some(a =>
+      ["click","fill","select","check","submit","getText"].includes(a.type)
+    );
+
+    // If we have navigate + interaction but AI had no HTML context,
+    // we need to re-ask AI after navigation with fresh HTML for accurate selectors
+    let needsSecondPass = hasNavigate && hasInteraction && !pageHtml;
+
+    // Execute each action sequentially with retry on element-not-found
     for (let i = 0; i < aiResponse.actions.length; i++) {
       if (stopRequested) {
         log("Execution stopped by user");
         return;
       }
 
-      const action = aiResponse.actions[i];
+      let action = aiResponse.actions[i];
       log(`Executing action ${i + 1}/${aiResponse.actions.length}: ${action.type}`);
 
       // Get fresh tab reference (tab may have navigated)
-      const currentTab = await getActiveTab();
-      await executeAction(action, currentTab.id);
+      let currentTab = await getActiveTab();
+
+      // After navigation, if we need interaction, re-ask AI with fresh page HTML
+      if (action.type === "navigate" && needsSecondPass) {
+        await executeAction(action, currentTab.id);
+        log("Re-reading page after navigation for accurate selectors...");
+        currentTab = await getActiveTab();
+        const freshHtml = isProtectedUrl(currentTab.url) ? null : await getPageHtml(currentTab.id);
+        if (freshHtml) {
+          const secondPrompt = `Command: ${command}\n\nI already navigated to ${currentTab.url}. Now I need to perform the remaining interactions.\n\nCurrent page HTML structure:\n${freshHtml}`;
+          const secondResponse = await callGroq(getSystemPrompt(true), secondPrompt);
+          if (secondResponse.actions && secondResponse.actions.length > 0) {
+            // Replace remaining actions with AI's new ones (skip any navigate actions since we're already there)
+            const newActions = secondResponse.actions.filter(a => a.type !== "navigate");
+            aiResponse.actions.splice(i + 1, aiResponse.actions.length, ...newActions);
+            log(`AI provided ${newActions.length} updated interaction action(s) with page context`);
+          }
+        }
+        needsSecondPass = false;
+        continue;
+      }
+
+      let retries = 0;
+      const maxRetries = 2;
+
+      while (true) {
+        try {
+          await executeAction(action, currentTab.id);
+          break; // success
+        } catch (err) {
+          if (err instanceof ElementNotFoundError && retries < maxRetries) {
+            retries++;
+            log(`Element not found, retrying with AI correction (attempt ${retries}/${maxRetries})...`);
+
+            // Re-read the page HTML to give AI fresh context
+            currentTab = await getActiveTab();
+            const freshHtml = isProtectedUrl(currentTab.url) ? null : await getPageHtml(currentTab.id);
+
+            const retryPrompt = `The previous action FAILED because the selector "${action.selector}" was not found on the page.
+Original command: ${command}
+Failed action: ${JSON.stringify(action)}
+
+${err.availableElements ? `Here are some elements actually on the page:\n${err.availableElements}\n` : ""}
+${freshHtml ? `Current page HTML structure:\n${freshHtml}` : `Current page URL: ${currentTab.url}`}
+
+Return a corrected single action with a working selector. Use ONLY elements from the HTML above. Return JSON: {"actions":[<one corrected action>],"explanation":"..."}`;
+
+            const corrected = await callGroq(getSystemPrompt(!!freshHtml), retryPrompt);
+            if (corrected.actions && corrected.actions.length > 0) {
+              action = corrected.actions[0];
+              log(`AI corrected selector to: ${action.selector || "(no selector)"}`);
+            } else {
+              throw new Error(`AI could not find a valid selector after retry`);
+            }
+          } else {
+            throw err;
+          }
+        }
+      }
     }
 
     log("All actions completed successfully!");
