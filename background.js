@@ -95,14 +95,20 @@ SELECTOR RULES (CRITICAL — violations cause failures):
 BEHAVIOR:
 - After navigate, STOP and return "done":false. You'll get the new page next call.
 - For search: fill the search box, then pressKey Enter on it.
-- For login: look for ANY input fields and ANY password field in the elements list. Use their selectors (the part after |).
+- Every website is different. Read the ELEMENTS list carefully to find login forms, signup buttons, search boxes, etc. Never assume a site's structure — always use what you see.
+- For login/signup: scan ALL elements for email/username/password inputs and submit buttons. Different sites use different field names, labels, and layouts.
 - When no page elements are shown, only navigate actions are possible.
 
-EXAMPLE — the selector comes from after the | in the page elements:
-Page element: input type="email" name="loginfmt" placeholder="Email" | input[name="loginfmt"]
-Correct action: {"type":"fill","selector":"input[name=\\"loginfmt\\"]","value":"user@mail.com"}
-Page element: button aria-label="Sign in" "Sign in" | [aria-label="Sign in"]
-Correct action: {"type":"click","selector":"[aria-label=\\"Sign in\\"]"}`;
+EXAMPLES — the selector ALWAYS comes from after the | in the page elements:
+
+Page element: input type="text" name="user" placeholder="Username" | input[name="user"]
+Correct action: {"type":"fill","selector":"input[name=\\"user\\"]","value":"myuser"}
+
+Page element: button "Log In" | #login-btn
+Correct action: {"type":"click","selector":"#login-btn"}
+
+Page element: a href="/signup" "Create Account" | a[href="/signup"]
+Correct action: {"type":"click","selector":"a[href=\\"/signup\\"]"}`;
 
 async function callAI(messages) {
   log("AI call...");
