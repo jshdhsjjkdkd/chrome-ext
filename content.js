@@ -296,6 +296,10 @@
       el.dispatchEvent(new KeyboardEvent("keypress", { key: char, bubbles: true }));
       el.dispatchEvent(new KeyboardEvent("keyup", { key: char, bubbles: true }));
     }
+
+    // Blur to trigger validation — some sites react to this
+    el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+    el.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
     return { success: true };
   }
 

@@ -262,6 +262,7 @@ async function handleCommand(command) {
   const conv = [{ role: "system", content: SYS }];
   let totalActions = 0;
   let lastUrl = "";
+  let lastCtxHash = "";
   let didNavigate = false;
   let stuckCount = 0;
 
@@ -275,17 +276,20 @@ async function handleCommand(command) {
       ctx = await readPage(tab.id);
     }
 
-    // Detect if we're stuck on the same page with no progress
-    if (tab.url === lastUrl && step > 0 && !didNavigate) {
+    // Detect if we're stuck — compare URL AND page content, not just URL
+    // A login page can stay on the same URL but change content (email → password step)
+    const ctxHash = ctx ? ctx.substring(0, 500) : "";
+    if (tab.url === lastUrl && ctxHash === lastCtxHash && step > 0 && !didNavigate) {
       stuckCount++;
-      if (stuckCount >= 3) {
-        log("Stuck — no progress after 3 attempts", "error");
+      if (stuckCount >= 4) {
+        log("Stuck — no progress after 4 attempts", "error");
         return;
       }
     } else {
       stuckCount = 0;
     }
     lastUrl = tab.url;
+    lastCtxHash = ctxHash;
     didNavigate = false;
 
     // 2. Build message
@@ -376,11 +380,14 @@ async function handleCommand(command) {
       const t = await getTab();
       const r = await runWithRetry(action, t.id, command);
       if (r.navigated) didNavigate = true;
+
+      // Wait after fill/click so the page can react (reveal next field, enable buttons)
+      if (action.type === "fill" || action.type === "click") await sleep(800);
     }
 
     // 6. Wait for page to settle
-    if (didNavigate) await sleep(1000);
-    await sleep(300);
+    if (didNavigate) await sleep(1500);
+    await sleep(500);
   }
 
   log("Reached step limit", "error");
