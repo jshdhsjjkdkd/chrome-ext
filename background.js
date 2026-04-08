@@ -62,7 +62,7 @@ HOW THE LOOP WORKS:
 5. You return the NEXT actions
 6. This repeats until the ENTIRE command is done
 
-RESPONSE FORMAT — JSON only, no markdown:
+RESPONSE FORMAT — raw JSON only, NO markdown, NO code blocks, NO backticks:
 {"actions":[...],"done":false}
 
 CRITICAL RULES FOR "done":
@@ -86,21 +86,23 @@ ACTION TYPES:
 {"type":"getText","selector":"css selector"}
 
 SELECTOR RULES (CRITICAL — violations cause failures):
-- Page elements are listed with sel="..." attributes. You MUST copy that EXACT sel value as your CSS selector.
-- NEVER use selectors from memory or training data. NEVER guess selectors like input[name='loginfmt'] or #email.
-- If you cannot find a matching element in the provided page elements, return a wait action instead.
-- Every website is different. The same site may have completely different selectors than you expect.
+- Page elements are listed as: description "visible text" | CSS_SELECTOR
+- The part after | is the CSS selector. Copy it EXACTLY into your action's "selector" field.
+- NEVER make up selectors. NEVER use selectors from your training data.
+- If you can't find a matching element, return a wait action instead.
+- Every website is different.
 
 BEHAVIOR:
 - After navigate, STOP and return "done":false. You'll get the new page next call.
 - For search: fill the search box, then pressKey Enter on it.
-- For login: look at the page elements for ANY input field (email, username, text) and ANY password field. Use their sel values.
+- For login: look for ANY input fields and ANY password field in the elements list. Use their selectors (the part after |).
 - When no page elements are shown, only navigate actions are possible.
 
-EXAMPLE — notice how selectors come from the page elements, NOT from memory:
-Page elements include: <input type="email" sel="#i0116" placeholder="Email"/>
-Correct: {"type":"fill","selector":"#i0116","value":"user@mail.com"}
-WRONG: {"type":"fill","selector":"input[name='loginfmt']","value":"user@mail.com"}`;
+EXAMPLE — the selector comes from after the | in the page elements:
+Page element: input type="email" name="loginfmt" placeholder="Email" | input[name="loginfmt"]
+Correct action: {"type":"fill","selector":"input[name=\\"loginfmt\\"]","value":"user@mail.com"}
+Page element: button aria-label="Sign in" "Sign in" | [aria-label="Sign in"]
+Correct action: {"type":"click","selector":"[aria-label=\\"Sign in\\"]"}`;
 
 async function callAI(messages) {
   log("AI call...");
@@ -228,7 +230,7 @@ async function runWithRetry(action, tabId, command) {
         const ctx = isProtected(tab.url) ? null : await readPage(tab.id);
         const fix = await callAI([
           { role: "system", content: SYS },
-          { role: "user", content: `Your selector FAILED because it does not exist on this page. Do NOT guess selectors — use ONLY sel="..." values from the elements below.\n\nCommand:"${command}"\nPage:${tab.url}\n${ctx ? "=== PAGE ELEMENTS ===\n" + ctx + "\n=== END ===" : ""}\n\nFailed: ${JSON.stringify(action)}\nError: ${err.message}\n${err.available ? "Available elements on page:\n" + err.available : ""}\n\nPick the correct element from above and return {"actions":[corrected action],"done":false}` }
+          { role: "user", content: `Your selector FAILED. Use the selector after the | character from the elements below.\n\nCommand:"${command}"\nPage:${tab.url}\n${ctx || ""}\n\nFailed: ${JSON.stringify(action)}\nError: ${err.message}\n${err.available ? "Available:\n" + err.available : ""}\n\nReturn {"actions":[corrected action],"done":false}` }
         ]);
         if (fix.actions?.[0]) { action = fix.actions[0]; }
         else throw new Error("AI can't fix selector");
@@ -284,7 +286,7 @@ async function handleCommand(command) {
     let m = `Command: ${command}\nCurrent page: ${tab.url}`;
     if (step > 0) m += `\nStep ${step + 1}. Previous actions completed. Continue with the remaining parts of the command.`;
     if (ctx) {
-      m += `\n\n=== PAGE ELEMENTS (use sel="..." values as CSS selectors) ===\n${ctx}\n=== END PAGE ELEMENTS ===\n\nIMPORTANT: For your actions, copy the EXACT sel="..." value from above as the "selector". Do NOT invent selectors.`;
+      m += `\n\n${ctx}\n\nUse the CSS selector after the | character for each element. Do NOT invent selectors.`;
     } else {
       m += `\n\nNo page elements available. Only navigate actions are possible.`;
     }
@@ -337,19 +339,31 @@ async function handleCommand(command) {
     for (let action of actions) {
       if (stopRequested) throw new StopError();
 
-      // Pre-validate: if the selector doesn't appear in page context, reject immediately
-      if (action.selector && ctx && !ctx.includes(action.selector)) {
-        log(`AI used wrong selector "${action.selector}" — not in page elements, asking for correction`);
-        // Ask AI to fix using a fresh copy of the page context
-        const t2 = await getTab();
-        const freshCtx = isProtected(t2.url) ? null : await readPage(t2.id);
-        const fixResp = await callAI([
-          { role: "system", content: SYS },
-          { role: "user", content: `Your selector "${action.selector}" does NOT exist on this page. You MUST use a sel="..." value from the page elements below.\n\nCommand: ${command}\nPage: ${t2.url}\n\n=== PAGE ELEMENTS ===\n${freshCtx || ctx}\n=== END ===\n\nOriginal action: ${JSON.stringify(action)}\nReturn {"actions":[corrected action with a selector FROM the page elements above],"done":false}` }
-        ]);
-        if (fixResp.actions?.[0]) {
-          action = fixResp.actions[0];
-          log(`Corrected to: ${action.selector}`);
+      // Pre-validate: check if AI's selector is in the page context
+      if (action.selector && ctx) {
+        // Extract all selectors from "| SELECTOR" format
+        const validSelectors = ctx.split("\n")
+          .map(line => { const i = line.lastIndexOf(" | "); return i >= 0 ? line.substring(i + 3).trim() : null; })
+          .filter(Boolean);
+
+        const selectorMatch = validSelectors.some(vs =>
+          vs === action.selector ||
+          action.selector.includes(vs) ||
+          vs.includes(action.selector)
+        );
+
+        if (!selectorMatch && validSelectors.length > 0) {
+          log(`AI used wrong selector "${action.selector}" — asking for correction`);
+          const t2 = await getTab();
+          const freshCtx = isProtected(t2.url) ? null : await readPage(t2.id);
+          const fixResp = await callAI([
+            { role: "system", content: SYS },
+            { role: "user", content: `Your selector "${action.selector}" does NOT exist on this page.\n\nCommand: ${command}\nPage: ${t2.url}\n\n${freshCtx || ctx}\n\nOriginal action: ${JSON.stringify(action)}\nReturn {"actions":[corrected action using a selector from the elements above (after the | character)],"done":false}` }
+          ]);
+          if (fixResp.actions?.[0]) {
+            action = fixResp.actions[0];
+            log(`Corrected to: ${action.selector}`);
+          }
         }
       }
 
