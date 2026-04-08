@@ -83,6 +83,7 @@ select: {"type":"select","selector":"CSS","value":"opt"}
 check: {"type":"check","selector":"CSS","checked":true}
 scroll: {"type":"scroll","direction":"down","amount":500}
 wait: {"type":"wait","duration":2000}
+captcha: {"type":"captcha"} — pauses and lets the user solve the CAPTCHA, then continues
 
 SELECTORS:
 - Elements shown as: description "text" | CSS_SELECTOR
@@ -104,7 +105,7 @@ WHEN AN ACTION FAILS — STOP AND RETHINK:
 HANDLING UNEXPECTED PAGES:
 - Cookie/consent banners → dismiss them first (click Accept/OK/Close/Got it)
 - "Stay signed in?" / "Remember me?" → click Yes/No and continue
-- CAPTCHA → return {"actions":[{"type":"wait","duration":5000}],"done":false,"thought":"CAPTCHA detected, waiting"}
+- CAPTCHA → return {"actions":[{"type":"captcha"}],"done":false,"thought":"CAPTCHA detected, waiting for user to solve it"}
 - Error messages (wrong password, locked account) → describe in thought, set done:true
 - 2FA / verification → look for available options and try to proceed
 - Blank or loading page → wait 2-3 seconds, then re-check
@@ -251,6 +252,22 @@ async function runAction(action, tabId) {
   if (action.type === "wait") {
     await sleep(Math.min(action.duration || 2000, 10000));
     return "waited";
+  }
+  if (action.type === "captcha") {
+    log("CAPTCHA detected — solve it manually, I'll continue after", "status");
+    // Poll page every 3s for up to 2 minutes, waiting for user to solve it
+    const before = await getPageHash(tabId);
+    for (let i = 0; i < 40; i++) {
+      if (stopRequested) throw new StopError();
+      await sleep(3000);
+      const now = await getPageHash(tabId);
+      if (now !== before) {
+        log("CAPTCHA solved — continuing", "status");
+        await sleep(1500);
+        return "captcha solved";
+      }
+    }
+    return "captcha timeout — page didn't change";
   }
 
   log(`${action.type}: ${action.selector || ""}`);
@@ -444,6 +461,13 @@ async function handleCommand(command) {
 }
 
 // ===========================================================
+async function getPageHash(tabId) {
+  try {
+    const ctx = await readPage(tabId);
+    return ctx ? hashStr(ctx) : 0;
+  } catch (e) { return 0; }
+}
+
 class StopError extends Error { constructor() { super("Stopped"); } }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0; return h; }
