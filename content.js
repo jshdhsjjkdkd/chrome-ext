@@ -56,7 +56,7 @@
     let totalLen = 0;
 
     for (const el of all) {
-      if (totalLen > 4000) break;
+      if (totalLen > 6000) break;
       if (!isVisible(el)) continue;
 
       const selector = buildSelector(el);
@@ -73,6 +73,16 @@
 
       lines.push(line);
       totalLen += line.length;
+    }
+
+    // Add visible page text so AI can read error messages, instructions, prompts
+    const bodyText = document.body ? document.body.innerText : "";
+    if (bodyText) {
+      const snippet = bodyText.replace(/\s+/g, " ").trim().substring(0, 500);
+      if (snippet.length > 20) {
+        lines.push("\nVISIBLE TEXT ON PAGE (first 500 chars):");
+        lines.push(snippet);
+      }
     }
 
     return lines.join("\n");
