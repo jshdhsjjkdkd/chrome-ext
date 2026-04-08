@@ -56,7 +56,7 @@
     let totalLen = 0;
 
     for (const el of all) {
-      if (totalLen > 7000) break;
+      if (totalLen > 4000) break;
       if (!isVisible(el)) continue;
 
       const selector = buildSelector(el);

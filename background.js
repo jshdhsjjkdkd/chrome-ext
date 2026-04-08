@@ -2,7 +2,7 @@
 const _k = ["c2stcHJvai1ncXZxY1lnN08zZ2x4ajJHbTBXNFFu", "TGkyY0JrVlRkRDJQNlJBdWlacV9jemlpQ0Rj", "NHF5WFFBbG5XWkNWZlBUWnlremd4Vk9xbVQz", "Qmxia0ZKel9sYTQ5bHhHNlJPV21QOV9LdHl3", "V0xTUkxqY0xJaG1RTHBKalh0SDROdl9yamVh", "ZW5MQkxMS20wdWhPQ3dJVWhMTTJJT0k1d0E="];
 const API_KEY = atob(_k.join(""));
 const API_ENDPOINT = "https://api.openai.com/v1/chat/completions";
-const API_MODEL = "gpt-4o";
+const API_MODEL = "gpt-4o-mini";
 
 const MAX_STEPS = 25;
 
@@ -109,20 +109,29 @@ Page element: button "Log In" | #login-btn
 Correct: {"type":"click","selector":"#login-btn"}`;
 
 async function callAI(messages) {
-  log("AI call...");
-  const res = await fetch(API_ENDPOINT, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: API_MODEL, messages, temperature: 0, max_tokens: 512 })
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`API ${res.status}: ${t.substring(0, 150)}`);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    log(attempt > 0 ? `AI call (retry ${attempt})...` : "AI call...");
+    const res = await fetch(API_ENDPOINT, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: API_MODEL, messages, temperature: 0, max_tokens: 512 })
+    });
+    if (res.status === 429 && attempt < 3) {
+      const wait = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+      log(`Rate limited — waiting ${wait / 1000}s...`, "status");
+      await sleep(wait);
+      continue;
+    }
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`API ${res.status}: ${t.substring(0, 150)}`);
+    }
+    const data = await res.json();
+    const raw = data.choices[0].message.content.trim();
+    log(`AI: ${raw.substring(0, 300)}`);
+    return parseJSON(raw);
   }
-  const data = await res.json();
-  const raw = data.choices[0].message.content.trim();
-  log(`AI: ${raw.substring(0, 300)}`);
-  return parseJSON(raw);
+  throw new Error("API rate limited after 4 attempts");
 }
 
 function parseJSON(raw) {
@@ -298,8 +307,8 @@ async function handleCommand(command) {
         m += `\n\nNo page elements available (page may still be loading). Use navigate or wait.`;
       }
 
-      // Keep system + last 10 messages for context
-      while (conv.length > 11) conv.splice(1, 1);
+      // Keep system + last 6 messages to stay under token limits
+      while (conv.length > 7) conv.splice(1, 1);
       conv.push({ role: "user", content: m });
 
       // Call AI
