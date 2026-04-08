@@ -24,6 +24,22 @@ function connectPort() {
   reconnectAttempts = 0;
 
   port.onMessage.addListener((msg) => {
+    // Restore state when popup reopens — background sends logs + running status
+    if (msg.type === "state") {
+      if (msg.logs && msg.logs.length > 0) {
+        for (const entry of msg.logs) {
+          addLogWithTime(entry.text, entry.level, entry.ts);
+        }
+      }
+      if (msg.isRunning) {
+        setRunning(true);
+      } else if (msg.lastResult === "done") {
+        setRunning(false, "done");
+      } else if (msg.lastResult === "error") {
+        setRunning(false, "error");
+      }
+      return;
+    }
     if (msg.type === "log") addLog(msg.text, msg.level);
     if (msg.type === "done") {
       addLog("Done", "success");
@@ -41,18 +57,26 @@ function connectPort() {
 connectPort();
 
 function addLog(text, level) {
-  const entry = document.createElement("div");
-  entry.classList.add("log-entry");
-  if (level) entry.classList.add(level);
-
   const ts = new Date().toLocaleTimeString("en-US", {
     hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit"
   });
+  appendLogEntry(text, level, ts);
+}
 
+function addLogWithTime(text, level, timestamp) {
+  const ts = new Date(timestamp).toLocaleTimeString("en-US", {
+    hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit"
+  });
+  appendLogEntry(text, level, ts);
+}
+
+function appendLogEntry(text, level, ts) {
+  const entry = document.createElement("div");
+  entry.classList.add("log-entry");
+  if (level) entry.classList.add(level);
   entry.innerHTML = `<span class="ts">${ts}</span>${escapeHtml(text)}`;
   statusLog.appendChild(entry);
   statusLog.scrollTop = statusLog.scrollHeight;
-
   while (statusLog.children.length > 100) statusLog.removeChild(statusLog.firstChild);
 }
 
@@ -84,7 +108,6 @@ function executeCommand() {
   const command = commandInput.value.trim();
   if (!command || running) return;
 
-  // Reset reconnect counter on user action so port stays alive
   reconnectAttempts = 0;
 
   addLog(`> ${command}`, "cmd");

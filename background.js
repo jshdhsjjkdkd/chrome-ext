@@ -11,11 +11,18 @@ let stopRequested = false;
 let isRunning = false;
 let popupPort = null;
 
-// --- Logging ---
+// --- Log buffer — survives popup close/reopen ---
+const logBuffer = [];
+let lastResult = null; // null = idle, "done", or "error:msg"
+
 function log(msg, level = "debug") {
   console.log(`[BG] ${msg}`);
-  if (level !== "debug" && popupPort) {
-    try { popupPort.postMessage({ type: "log", text: msg, level }); } catch (e) {}
+  if (level !== "debug") {
+    logBuffer.push({ text: msg, level, ts: Date.now() });
+    if (logBuffer.length > 50) logBuffer.shift();
+    if (popupPort) {
+      try { popupPort.postMessage({ type: "log", text: msg, level }); } catch (e) {}
+    }
   }
 }
 
@@ -23,12 +30,24 @@ function log(msg, level = "debug") {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "popup") return;
   popupPort = port;
+
+  // Send current state so popup can restore after reopen
+  try {
+    port.postMessage({ type: "state", isRunning, logs: logBuffer, lastResult });
+  } catch (e) {}
+
   port.onMessage.addListener((msg) => {
     if (msg.type === "execute") {
       handleCommand(msg.command)
-        .then(() => { try { port.postMessage({ type: "done" }); } catch (e) {} })
+        .then(() => {
+          lastResult = "done";
+          try { port.postMessage({ type: "done" }); } catch (e) {}
+        })
         .catch((err) => {
-          if (!(err instanceof StopError)) log(err.message, "error");
+          if (!(err instanceof StopError)) {
+            log(err.message, "error");
+            lastResult = "error";
+          }
           try { port.postMessage({ type: "error", error: err.message }); } catch (e) {}
         });
     }
@@ -42,8 +61,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return;
   if (msg.type === "execute" && !popupPort) {
     handleCommand(msg.command)
-      .then(() => sendResponse({ success: true }))
-      .catch(err => sendResponse({ success: false, error: err.message }));
+      .then(() => { lastResult = "done"; sendResponse({ success: true }); })
+      .catch(err => { lastResult = "error"; sendResponse({ success: false, error: err.message }); });
     return true;
   }
   if (msg.type === "stop") { stopRequested = true; sendResponse({ success: true }); }
@@ -117,7 +136,7 @@ async function callAI(messages) {
       body: JSON.stringify({ model: API_MODEL, messages, temperature: 0, max_tokens: 512 })
     });
     if (res.status === 429 && attempt < 3) {
-      const wait = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+      const wait = Math.pow(2, attempt + 1) * 1000;
       log(`Rate limited — waiting ${wait / 1000}s...`, "status");
       await sleep(wait);
       continue;
@@ -206,7 +225,7 @@ async function readPage(tabId) {
 }
 
 // ===========================================================
-// ACTION EXECUTION — simple, no retries. AI handles errors.
+// ACTION EXECUTION
 // ===========================================================
 async function runAction(action, tabId) {
   if (stopRequested) throw new StopError();
@@ -227,7 +246,6 @@ async function runAction(action, tabId) {
   await inject(tabId);
   const result = await sendMsg(tabId, "executeAction", { action });
   if (result.error) {
-    // Return error info — AI will see this and correct
     let msg = result.error;
     if (result.availableElements) msg += "\nAvailable elements on page:\n" + result.availableElements;
     throw new Error(msg);
@@ -236,7 +254,7 @@ async function runAction(action, tabId) {
 }
 
 // ===========================================================
-// MAIN LOOP — AI-driven. Errors go back to AI, not retried programmatically.
+// MAIN LOOP
 // ===========================================================
 function isMultiPart(cmd) {
   return /\band\b|\bthen\b|\bafter\b|\balso\b|,/i.test(cmd);
@@ -246,11 +264,12 @@ async function handleCommand(command) {
   if (isRunning) throw new Error("Already running a command");
   isRunning = true;
   stopRequested = false;
+  lastResult = null;
+  logBuffer.length = 0;
 
   try {
     log(command, "status");
 
-    // Lock onto the current tab
     const startTab = await getTab();
     const tabId = startTab.id;
 
@@ -264,7 +283,6 @@ async function handleCommand(command) {
     for (let step = 0; step < MAX_STEPS; step++) {
       if (stopRequested) throw new StopError();
 
-      // Get current state of our locked tab
       let tab;
       try {
         tab = await chrome.tabs.get(tabId);
@@ -277,7 +295,6 @@ async function handleCommand(command) {
         ctx = await readPage(tabId);
       }
 
-      // Stuck detection — both URL AND content must be unchanged
       const ctxHash = ctx ? ctx.substring(0, 500) : "";
       if (tab.url === lastUrl && ctxHash === lastCtxHash && step > 0) {
         stuckCount++;
@@ -291,7 +308,6 @@ async function handleCommand(command) {
       lastUrl = tab.url;
       lastCtxHash = ctxHash;
 
-      // Build message — include action results so AI knows what worked/failed
       let m = `Command: ${command}\nPage: ${tab.url}`;
 
       if (actionResults) {
@@ -307,17 +323,14 @@ async function handleCommand(command) {
         m += `\n\nNo page elements available (page may still be loading). Use navigate or wait.`;
       }
 
-      // Keep system + last 6 messages to stay under token limits
       while (conv.length > 7) conv.splice(1, 1);
       conv.push({ role: "user", content: m });
 
-      // Call AI
       const resp = await callAI(conv);
       conv.push({ role: "assistant", content: JSON.stringify(resp) });
 
       const actions = resp.actions || [];
 
-      // Done check
       if (resp.done === true && actions.length === 0) {
         if (step <= 1 && isMultiPart(command) && totalActions <= 1) {
           log("AI tried to stop early — continuing...");
@@ -337,7 +350,6 @@ async function handleCommand(command) {
       totalActions += actions.length;
       log(`Working... (${totalActions} actions done)`, "status");
 
-      // Execute actions — collect results for AI feedback
       const results = [];
       let didNavigate = false;
 
@@ -351,14 +363,12 @@ async function handleCommand(command) {
         } catch (err) {
           if (err instanceof StopError) throw err;
           results.push(`FAILED: ${action.type} ${action.selector || ""} — ${err.message}`);
-          break; // Stop batch — AI will see the error and decide what to do next
+          break;
         }
 
-        // Wait after fill/click for page to react
         if (action.type === "fill" || action.type === "click") await sleep(800);
       }
 
-      // Store results — AI sees these on next iteration
       actionResults = results.join("\n");
 
       if (didNavigate) await sleep(1500);
