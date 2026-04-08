@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "AI Task Automator",
+  "version": "1.0.0",
+  "description": "Automate websites using natural language commands powered by Groq AI",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI Task Automator"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {}
+}
