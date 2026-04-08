@@ -1,228 +1,234 @@
-// Content script for AI Task Automator
-// Injected dynamically via chrome.scripting.executeScript
-
+// Content script — injected dynamically by background.js
 (function() {
-  // Prevent double-injection
-  if (window.__aiTaskAutomatorInjected) return;
-  window.__aiTaskAutomatorInjected = true;
+  if (window.__aiTaskAutomator) return;
+  window.__aiTaskAutomator = true;
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.type === "getHTML") {
+    if (msg.type === "getPageContext") {
       try {
-        const html = extractPageStructure();
-        sendResponse({ html: html });
+        sendResponse({ context: extractPageContext() });
       } catch (err) {
-        sendResponse({ html: document.title || "", error: err.message });
+        sendResponse({ context: `<title>${document.title}</title>`, error: err.message });
       }
       return true;
     }
 
     if (msg.type === "executeAction") {
-      executeAction(msg.action)
-        .then(result => sendResponse(result))
-        .catch(err => sendResponse({ error: err.message }));
+      runAction(msg.action)
+        .then(r => sendResponse(r))
+        .catch(e => sendResponse({ error: e.message }));
       return true;
     }
   });
 
-  // Extract only meaningful, interactive elements from the page
-  // instead of dumping raw outerHTML full of scripts/styles/SVGs
-  function extractPageStructure() {
-    const parts = [];
-    parts.push(`<title>${document.title}</title>`);
-    parts.push(`<url>${location.href}</url>`);
+  // =========================================================
+  // PAGE CONTEXT EXTRACTION
+  // Builds a clean, concise summary of all interactive elements
+  // with unique selectors the AI can directly use
+  // =========================================================
+  function extractPageContext() {
+    const lines = [];
+    lines.push(`TITLE: ${document.title}`);
+    lines.push(`URL: ${location.href}`);
+    lines.push("---ELEMENTS---");
 
-    // Collect all interactive and meaningful elements
-    const selectors = [
-      "a[href]",
-      "button",
-      "input",
-      "textarea",
-      "select",
-      "[role='button']",
-      "[role='link']",
-      "[role='tab']",
-      "[role='menuitem']",
-      "[role='search']",
-      "[onclick]",
-      "[data-action]",
-      "form",
-      "label",
-      "nav",
-      "h1", "h2", "h3",
-      "[aria-label]",
-      "[contenteditable]"
+    const INTERACTIVE = [
+      "a[href]", "button", "input", "textarea", "select",
+      "[role='button']", "[role='link']", "[role='tab']", "[role='menuitem']",
+      "[role='search']", "[role='textbox']", "[role='combobox']",
+      "[contenteditable='true']", "[onclick]", "[data-action]",
+      "form", "label[for]",
+      "h1", "h2", "h3"
     ];
 
     const seen = new Set();
-    const elements = document.querySelectorAll(selectors.join(","));
+    const all = document.querySelectorAll(INTERACTIVE.join(","));
+    let totalLen = 0;
 
-    for (const el of elements) {
-      // Skip hidden elements
-      if (el.offsetParent === null && el.tagName !== "INPUT" && el.getAttribute("type") !== "hidden") continue;
+    for (const el of all) {
+      if (totalLen > 7000) break;
+
+      // Skip invisible elements (but keep hidden inputs)
+      if (!isVisible(el) && !(el.tagName === "INPUT" && el.type === "hidden")) continue;
+
+      const selector = buildUniqueSelector(el);
+      if (!selector || seen.has(selector)) continue;
+      seen.add(selector);
 
       const tag = el.tagName.toLowerCase();
-      const attrs = [];
+      const parts = [`<${tag}`];
 
-      // Collect useful attributes only
-      if (el.id) attrs.push(`id="${el.id}"`);
-      if (el.name) attrs.push(`name="${el.name}"`);
-      if (el.className && typeof el.className === "string") {
-        const cls = el.className.trim().split(/\s+/).slice(0, 3).join(" ");
-        if (cls) attrs.push(`class="${cls}"`);
-      }
-      if (el.type) attrs.push(`type="${el.type}"`);
-      if (el.href) {
-        const href = el.getAttribute("href");
-        if (href && !href.startsWith("javascript:")) attrs.push(`href="${href.substring(0, 100)}"`);
-      }
-      if (el.getAttribute("aria-label")) attrs.push(`aria-label="${el.getAttribute("aria-label")}"`);
-      if (el.getAttribute("role")) attrs.push(`role="${el.getAttribute("role")}"`);
-      if (el.getAttribute("placeholder")) attrs.push(`placeholder="${el.getAttribute("placeholder")}"`);
-      if (el.getAttribute("data-testid")) attrs.push(`data-testid="${el.getAttribute("data-testid")}"`);
-      if (el.getAttribute("for")) attrs.push(`for="${el.getAttribute("for")}"`);
-      if (el.getAttribute("value") && tag === "input") attrs.push(`value="${el.getAttribute("value").substring(0, 50)}"`);
-      if (el.getAttribute("action") && tag === "form") attrs.push(`action="${el.getAttribute("action").substring(0, 100)}"`);
-      if (el.getAttribute("method") && tag === "form") attrs.push(`method="${el.getAttribute("method")}"`);
+      // Key attributes
+      const attrs = getKeyAttributes(el, tag);
+      if (attrs) parts.push(attrs);
+      parts.push(`sel="${selector}"`);
 
-      // Get visible text (short)
-      let text = "";
-      if (tag !== "input" && tag !== "textarea" && tag !== "select" && tag !== "form" && tag !== "nav") {
-        text = (el.textContent || "").trim().replace(/\s+/g, " ").substring(0, 60);
+      // Visible text
+      const text = getVisibleText(el, tag);
+      if (text) {
+        parts.push(`>${text}</${tag}>`);
+      } else {
+        parts.push(`/>`);
       }
 
-      const line = `<${tag}${attrs.length ? " " + attrs.join(" ") : ""}>${text ? text : ""}</${tag}>`;
-
-      // Deduplicate
-      if (seen.has(line)) continue;
-      seen.add(line);
-      parts.push(line);
-
-      // Stop if we're getting too long
-      if (parts.join("\n").length > 7500) break;
+      const line = parts.join(" ");
+      lines.push(line);
+      totalLen += line.length;
     }
 
-    return parts.join("\n");
+    return lines.join("\n");
   }
 
-  async function executeAction(action) {
+  function isVisible(el) {
+    if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    return true;
+  }
+
+  function buildUniqueSelector(el) {
+    // Priority: id > name > unique aria-label > data-testid > computed path
+    if (el.id) return `#${CSS.escape(el.id)}`;
+
+    const tag = el.tagName.toLowerCase();
+
+    if (el.name && (tag === "input" || tag === "textarea" || tag === "select")) {
+      const sel = `${tag}[name="${CSS.escape(el.name)}"]`;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel) {
+      const sel = `[aria-label="${CSS.escape(ariaLabel)}"]`;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+
+    const testId = el.getAttribute("data-testid");
+    if (testId) {
+      const sel = `[data-testid="${CSS.escape(testId)}"]`;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+
+    const placeholder = el.getAttribute("placeholder");
+    if (placeholder) {
+      const sel = `${tag}[placeholder="${CSS.escape(placeholder)}"]`;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+
+    const role = el.getAttribute("role");
+    if (role) {
+      const sel = `[role="${CSS.escape(role)}"]`;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+
+    if (tag === "input" && el.type) {
+      const sel = `input[type="${el.type}"]`;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+
+    // Build a path-based selector
+    return buildPathSelector(el);
+  }
+
+  function buildPathSelector(el) {
+    const parts = [];
+    let cur = el;
+    while (cur && cur !== document.body && parts.length < 4) {
+      let seg = cur.tagName.toLowerCase();
+      if (cur.id) {
+        parts.unshift(`#${CSS.escape(cur.id)} `);
+        break;
+      }
+      // Add nth-of-type if needed
+      const parent = cur.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+        if (siblings.length > 1) {
+          const idx = siblings.indexOf(cur) + 1;
+          seg += `:nth-of-type(${idx})`;
+        }
+      }
+      parts.unshift(seg);
+      cur = cur.parentElement;
+    }
+    const sel = parts.join(" > ").replace(/\s+/g, " ").trim();
+    try {
+      if (document.querySelector(sel) === el) return sel;
+    } catch (e) {}
+    return null;
+  }
+
+  function getKeyAttributes(el, tag) {
+    const parts = [];
+    if (el.type && tag === "input") parts.push(`type="${el.type}"`);
+    if (el.name) parts.push(`name="${el.name}"`);
+    if (el.placeholder) parts.push(`placeholder="${el.placeholder.substring(0, 50)}"`);
+    if (el.getAttribute("aria-label")) parts.push(`aria-label="${el.getAttribute("aria-label").substring(0, 50)}"`);
+    if (el.getAttribute("role")) parts.push(`role="${el.getAttribute("role")}"`);
+    if (el.href) {
+      const href = el.getAttribute("href");
+      if (href && !href.startsWith("javascript:")) parts.push(`href="${href.substring(0, 80)}"`);
+    }
+    if (el.getAttribute("value") && tag === "input" && el.type !== "password") {
+      parts.push(`value="${el.getAttribute("value").substring(0, 30)}"`);
+    }
+    if (el.getAttribute("action") && tag === "form") parts.push(`action="${el.getAttribute("action").substring(0, 80)}"`);
+    return parts.length ? parts.join(" ") : "";
+  }
+
+  function getVisibleText(el, tag) {
+    if (["input", "textarea", "select", "form"].includes(tag)) return "";
+    const text = (el.textContent || "").trim().replace(/\s+/g, " ");
+    return text.substring(0, 60);
+  }
+
+  // =========================================================
+  // ACTION EXECUTION
+  // =========================================================
+  async function runAction(action) {
     switch (action.type) {
-      case "click": {
-        const el = findElement(action);
-        if (!el) return { error: `Element not found: ${action.selector}`, availableElements: getSimilarElements(action) };
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        await sleep(300);
-        el.click();
-        return { success: true };
-      }
-
-      case "fill": {
-        const el = findElement(action);
-        if (!el) return { error: `Element not found: ${action.selector}`, availableElements: getSimilarElements(action) };
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.focus();
-        el.value = "";
-        el.dispatchEvent(new Event("focus", { bubbles: true }));
-        // Set value directly then dispatch events for framework compat
-        el.value = action.value;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        // Also try native input event setter for React
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, "value"
-        )?.set || Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype, "value"
-        )?.set;
-        if (nativeInputValueSetter) {
-          nativeInputValueSetter.call(el, action.value);
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-        return { success: true };
-      }
-
-      case "select": {
-        const el = findElement(action);
-        if (!el) return { error: `Element not found: ${action.selector}`, availableElements: getSimilarElements(action) };
-        el.value = action.value;
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        return { success: true };
-      }
-
-      case "check": {
-        const el = findElement(action);
-        if (!el) return { error: `Element not found: ${action.selector}`, availableElements: getSimilarElements(action) };
-        const shouldCheck = action.checked !== undefined ? action.checked : true;
-        if (el.checked !== shouldCheck) {
-          el.click();
-        }
-        return { success: true };
-      }
-
-      case "submit": {
-        const el = findElement(action);
-        if (!el) return { error: `Element not found: ${action.selector}`, availableElements: getSimilarElements(action) };
-        if (el.tagName === "FORM") {
-          el.submit();
-        } else {
-          const form = el.closest("form");
-          if (form) form.submit();
-          else el.click();
-        }
-        return { success: true };
-      }
-
-      case "scroll": {
-        const amount = action.amount || 500;
-        const dir = action.direction || "down";
-        let x = 0, y = 0;
-        switch (dir) {
-          case "down":  y = amount; break;
-          case "up":    y = -amount; break;
-          case "right": x = amount; break;
-          case "left":  x = -amount; break;
-        }
-        window.scrollBy({ left: x, top: y, behavior: "smooth" });
-        return { success: true };
-      }
-
-      case "getText": {
-        const el = findElement(action);
-        if (!el) return { error: `Element not found: ${action.selector}`, availableElements: getSimilarElements(action) };
-        return { success: true, text: el.textContent.trim() };
-      }
-
-      default:
-        return { error: `Unknown action type: ${action.type}` };
+      case "click": return doClick(action);
+      case "fill": return doFill(action);
+      case "pressKey": return doPressKey(action);
+      case "submit": return doSubmit(action);
+      case "select": return doSelect(action);
+      case "check": return doCheck(action);
+      case "scroll": return doScroll(action);
+      case "getText": return doGetText(action);
+      default: return { error: `Unknown action: ${action.type}` };
     }
   }
 
-  // Smart element finder — tries selector first, then falls back to text matching
-  function findElement(action) {
-    // Try the CSS selector first
+  function findEl(action) {
+    // 1. Try the exact selector
     if (action.selector) {
       try {
         const el = document.querySelector(action.selector);
         if (el) return el;
-      } catch (e) { /* invalid selector */ }
+      } catch (e) {}
     }
 
-    // Fallback: try to find by text content if the selector looks like it has text clues
+    // 2. Try fuzzy text match on interactive elements
     if (action.selector) {
-      const textHint = action.selector
-        .replace(/[\[\](){}='"~^$*>+#.:,]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
+      const hint = action.selector
+        .replace(/[[\](){}='"~^$*>+#.:,\\]/g, " ")
+        .replace(/\s+/g, " ").trim().toLowerCase();
 
-      if (textHint.length > 2) {
-        // Search buttons and links by text
-        const candidates = document.querySelectorAll("a, button, [role='button'], input[type='submit'], input[type='button']");
+      if (hint.length > 1) {
+        const candidates = document.querySelectorAll(
+          "a, button, [role='button'], [role='link'], input[type='submit'], input[type='button']"
+        );
+        // Exact text match first
         for (const el of candidates) {
-          const elText = (el.textContent || el.value || el.getAttribute("aria-label") || "").toLowerCase();
-          if (elText.includes(textHint) || textHint.includes(elText.trim())) {
-            return el;
-          }
+          if (!isVisible(el)) continue;
+          const t = (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
+          if (t === hint) return el;
+        }
+        // Partial match
+        for (const el of candidates) {
+          if (!isVisible(el)) continue;
+          const t = (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
+          if (t.includes(hint) || hint.includes(t)) return el;
         }
       }
     }
@@ -230,45 +236,153 @@
     return null;
   }
 
-  // When element not found, report what similar elements exist so AI can retry
-  function getSimilarElements(action) {
-    const tag = (action.selector || "").match(/^(\w+)/)?.[1] || "";
-    const searchTags = tag ? tag : "a,button,[role='button'],input,textarea";
-    const elements = [];
-    try {
-      const els = document.querySelectorAll(searchTags);
-      for (const el of els) {
-        if (el.offsetParent === null) continue;
-        const desc = describeElement(el);
-        if (desc) elements.push(desc);
-        if (elements.length >= 15) break;
-      }
-    } catch (e) {
-      // If tag selector fails, search common interactive elements
-      const els = document.querySelectorAll("a,button,[role='button'],input");
-      for (const el of els) {
-        if (el.offsetParent === null) continue;
-        const desc = describeElement(el);
-        if (desc) elements.push(desc);
-        if (elements.length >= 15) break;
+  function notFound(action) {
+    return {
+      error: `Element not found: ${action.selector}`,
+      availableElements: collectAvailableElements()
+    };
+  }
+
+  function collectAvailableElements() {
+    const lines = [];
+    const els = document.querySelectorAll(
+      "a[href], button, input, textarea, select, [role='button'], [role='link'], [role='tab']"
+    );
+    for (const el of els) {
+      if (!isVisible(el)) continue;
+      const sel = buildUniqueSelector(el);
+      const text = (el.textContent || el.value || el.placeholder || el.getAttribute("aria-label") || "").trim().substring(0, 50);
+      const tag = el.tagName.toLowerCase();
+      lines.push(`${tag} sel="${sel}" "${text}"`);
+      if (lines.length >= 25) break;
+    }
+    return lines.join("\n");
+  }
+
+  // --- Individual actions ---
+
+  async function doClick(action) {
+    const el = findEl(action);
+    if (!el) return notFound(action);
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    await sleep(200);
+    // Simulate real click sequence
+    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    el.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    el.click();
+    return { success: true };
+  }
+
+  async function doFill(action) {
+    const el = findEl(action);
+    if (!el) return notFound(action);
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+
+    // Focus
+    el.focus();
+    el.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
+    el.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+
+    // Clear existing value
+    el.value = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+
+    // Set value using native setter (works with React/Angular/Vue)
+    const proto = el.tagName === "TEXTAREA"
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+
+    if (nativeSetter) {
+      nativeSetter.call(el, action.value);
+    } else {
+      el.value = action.value;
+    }
+
+    // Fire events that frameworks listen for
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+
+    // Also dispatch keyboard events for sites that need them
+    for (const char of action.value) {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: char, bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent("keypress", { key: char, bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: char, bubbles: true }));
+    }
+
+    return { success: true };
+  }
+
+  async function doPressKey(action) {
+    const el = action.selector ? findEl(action) : document.activeElement;
+    if (!el) return notFound(action);
+
+    const key = action.key || "Enter";
+    const keyCode = key === "Enter" ? 13 : key === "Tab" ? 9 : key === "Escape" ? 27 : 0;
+
+    el.dispatchEvent(new KeyboardEvent("keydown", { key, code: `Key${key}`, keyCode, bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keypress", { key, code: `Key${key}`, keyCode, bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key, code: `Key${key}`, keyCode, bubbles: true }));
+
+    // For Enter on forms, also try to submit
+    if (key === "Enter") {
+      const form = el.closest("form");
+      if (form) {
+        form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       }
     }
-    return elements.join("\n");
+
+    return { success: true };
   }
 
-  function describeElement(el) {
-    const tag = el.tagName.toLowerCase();
-    const parts = [tag];
-    if (el.id) parts.push(`id="${el.id}"`);
-    if (el.className && typeof el.className === "string") parts.push(`class="${el.className.trim().split(/\s+/).slice(0, 2).join(" ")}"`);
-    if (el.getAttribute("aria-label")) parts.push(`aria-label="${el.getAttribute("aria-label")}"`);
-    if (el.href) parts.push(`href="${el.getAttribute("href")?.substring(0, 60)}"`);
-    const text = (el.textContent || "").trim().substring(0, 40);
-    if (text) parts.push(`"${text}"`);
-    return parts.join(" ");
+  async function doSubmit(action) {
+    const el = findEl(action);
+    if (!el) return notFound(action);
+
+    const form = el.tagName === "FORM" ? el : el.closest("form");
+    if (form) {
+      const submitBtn = form.querySelector("[type='submit'], button:not([type='button'])");
+      if (submitBtn) submitBtn.click();
+      else form.requestSubmit ? form.requestSubmit() : form.submit();
+    } else {
+      el.click();
+    }
+    return { success: true };
   }
 
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  async function doSelect(action) {
+    const el = findEl(action);
+    if (!el) return notFound(action);
+    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+    if (nativeSetter) nativeSetter.call(el, action.value);
+    else el.value = action.value;
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { success: true };
   }
+
+  async function doCheck(action) {
+    const el = findEl(action);
+    if (!el) return notFound(action);
+    const want = action.checked !== undefined ? action.checked : true;
+    if (el.checked !== want) el.click();
+    return { success: true };
+  }
+
+  async function doScroll(action) {
+    const amount = action.amount || 500;
+    const map = { down: [0, amount], up: [0, -amount], right: [amount, 0], left: [-amount, 0] };
+    const [x, y] = map[action.direction || "down"] || [0, amount];
+    window.scrollBy({ left: x, top: y, behavior: "smooth" });
+    return { success: true };
+  }
+
+  async function doGetText(action) {
+    const el = findEl(action);
+    if (!el) return notFound(action);
+    return { success: true, text: el.textContent.trim().substring(0, 2000) };
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 })();

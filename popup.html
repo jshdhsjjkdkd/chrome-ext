@@ -3,153 +3,224 @@
 <head>
   <meta charset="utf-8">
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
 
     body {
-      width: 600px;
-      min-height: 420px;
+      width: 650px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #1a1a2e;
+      background: #0f0f1a;
       color: #e0e0e0;
-      padding: 20px;
     }
 
-    h1 {
-      font-size: 20px;
-      font-weight: 600;
+    .header {
+      background: linear-gradient(135deg, #1a1a3e 0%, #0f0f2a 100%);
+      padding: 18px 22px 14px;
+      border-bottom: 1px solid #252545;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 700;
       color: #00d4ff;
-      margin-bottom: 16px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
+      letter-spacing: 0.3px;
     }
 
-    h1::before {
-      content: "\26A1";
+    .header h1 span {
+      color: #5a5a8a;
+      font-weight: 400;
+      font-size: 12px;
+      margin-left: 8px;
     }
 
-    .input-group {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 12px;
+    .main {
+      padding: 16px 22px 20px;
+    }
+
+    .input-area {
+      position: relative;
+      margin-bottom: 14px;
     }
 
     #commandInput {
-      flex: 1;
-      padding: 14px 16px;
-      border: 1px solid #333;
-      border-radius: 8px;
-      background: #16213e;
-      color: #e0e0e0;
-      font-size: 15px;
+      width: 100%;
+      min-height: 56px;
+      max-height: 120px;
+      padding: 16px 18px;
+      padding-right: 60px;
+      border: 2px solid #252545;
+      border-radius: 12px;
+      background: #141428;
+      color: #e8e8f0;
+      font-size: 16px;
+      font-family: inherit;
+      line-height: 1.5;
+      resize: vertical;
       outline: none;
       transition: border-color 0.2s;
     }
 
     #commandInput:focus {
       border-color: #00d4ff;
+      box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
     }
 
     #commandInput::placeholder {
-      color: #666;
+      color: #4a4a6a;
+      font-size: 15px;
+    }
+
+    .char-count {
+      position: absolute;
+      bottom: 8px;
+      right: 14px;
+      font-size: 11px;
+      color: #3a3a5a;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
     }
 
     .btn {
-      padding: 14px 22px;
+      padding: 12px 28px;
       border: none;
-      border-radius: 8px;
+      border-radius: 10px;
       font-size: 15px;
-      font-weight: 600;
+      font-weight: 700;
       cursor: pointer;
-      transition: opacity 0.2s;
+      transition: all 0.15s;
+      letter-spacing: 0.3px;
     }
 
-    .btn:hover {
-      opacity: 0.85;
-    }
-
-    .btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
+    .btn:active { transform: scale(0.97); }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
 
     #executeBtn {
-      background: #00d4ff;
-      color: #1a1a2e;
+      background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+      color: #0a0a1a;
+      flex: 1;
     }
+    #executeBtn:hover:not(:disabled) { background: linear-gradient(135deg, #00e5ff 0%, #00aadd 100%); }
 
     #stopBtn {
-      background: #ff4757;
+      background: linear-gradient(135deg, #ff4757 0%, #cc2233 100%);
       color: #fff;
+      width: 100px;
+    }
+    #stopBtn:hover:not(:disabled) { background: linear-gradient(135deg, #ff5a6a 0%, #dd3344 100%); }
+
+    #clearBtn {
+      background: transparent;
+      border: 1px solid #333;
+      color: #888;
+      width: 80px;
+      padding: 12px 0;
+    }
+    #clearBtn:hover { border-color: #555; color: #aaa; }
+
+    .log-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
     }
 
-    .status-header {
-      font-size: 13px;
-      font-weight: 600;
-      color: #888;
+    .log-header span {
+      font-size: 11px;
+      font-weight: 700;
+      color: #5a5a7a;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 6px;
+      letter-spacing: 1px;
+    }
+
+    #statusIndicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    #statusIndicator .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #2ecc71;
+    }
+
+    #statusIndicator.running .dot {
+      background: #f39c12;
+      animation: pulse 1s infinite;
+    }
+
+    #statusIndicator.error .dot { background: #e74c3c; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
     }
 
     #statusLog {
-      background: #0f0f23;
-      border: 1px solid #333;
-      border-radius: 8px;
-      padding: 12px;
-      height: 280px;
+      background: #0a0a16;
+      border: 1px solid #1e1e38;
+      border-radius: 10px;
+      padding: 14px;
+      height: 300px;
       overflow-y: auto;
-      font-family: 'Consolas', 'Monaco', monospace;
-      font-size: 13px;
-      line-height: 1.7;
+      font-family: 'SF Mono', 'Consolas', 'Monaco', 'Menlo', monospace;
+      font-size: 12px;
+      line-height: 1.8;
     }
 
     .log-entry {
-      color: #8892b0;
+      color: #6a6a8a;
       word-wrap: break-word;
+      padding: 1px 0;
     }
 
-    .log-entry.info {
-      color: #64ffda;
-    }
+    .log-entry.cmd { color: #00d4ff; font-weight: 600; }
+    .log-entry.info { color: #8892b0; }
+    .log-entry.success { color: #2ecc71; }
+    .log-entry.action { color: #f1c40f; }
+    .log-entry.error { color: #e74c3c; }
+    .log-entry.ai { color: #a78bfa; }
+    .log-entry.retry { color: #f39c12; }
+    .log-entry .ts { color: #3a3a5a; margin-right: 6px; }
 
-    .log-entry.error {
-      color: #ff4757;
-    }
-
-    .log-entry.action {
-      color: #ffd93d;
-    }
-
-    #statusLog::-webkit-scrollbar {
-      width: 6px;
-    }
-
-    #statusLog::-webkit-scrollbar-track {
-      background: transparent;
-    }
-
-    #statusLog::-webkit-scrollbar-thumb {
-      background: #333;
-      border-radius: 3px;
-    }
+    #statusLog::-webkit-scrollbar { width: 5px; }
+    #statusLog::-webkit-scrollbar-track { background: transparent; }
+    #statusLog::-webkit-scrollbar-thumb { background: #252545; border-radius: 3px; }
+    #statusLog::-webkit-scrollbar-thumb:hover { background: #353555; }
   </style>
 </head>
 <body>
-  <h1>AI Task Automator</h1>
-
-  <div class="input-group">
-    <input type="text" id="commandInput" placeholder="e.g. go to youtube and search for cats" autofocus>
-    <button class="btn" id="executeBtn">Execute</button>
-    <button class="btn" id="stopBtn" disabled>Stop</button>
+  <div class="header">
+    <h1>AI Task Automator <span>v2.0</span></h1>
   </div>
 
-  <div class="status-header">Status Log</div>
-  <div id="statusLog"></div>
+  <div class="main">
+    <div class="input-area">
+      <textarea id="commandInput" rows="2" placeholder="Type a command... e.g. &quot;go to youtube and search for cats&quot;" autofocus></textarea>
+      <div class="char-count"><span id="charCount">0</span></div>
+    </div>
+
+    <div class="controls">
+      <button class="btn" id="executeBtn">Execute</button>
+      <button class="btn" id="stopBtn" disabled>Stop</button>
+      <button class="btn" id="clearBtn">Clear</button>
+    </div>
+
+    <div class="log-header">
+      <span>Activity Log</span>
+      <div id="statusIndicator">
+        <div class="dot"></div>
+        <span id="statusText">Ready</span>
+      </div>
+    </div>
+    <div id="statusLog"></div>
+  </div>
 
   <script src="popup.js"></script>
 </body>
