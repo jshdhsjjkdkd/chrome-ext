@@ -11,9 +11,7 @@ const MAX_RETRIES = 2;
 let stopRequested = false;
 let popupPort = null;
 
-// --- Logging ---
-// "status" = shown to user (task done, errors only)
-// "debug" = console only (verbose, never shown in popup)
+// --- Logging: "status" shown in popup, "debug" console only ---
 function log(msg, level = "debug") {
   console.log(`[BG] ${msg}`);
   if (level !== "debug" && popupPort) {
@@ -34,10 +32,7 @@ chrome.runtime.onConnect.addListener((port) => {
           try { port.postMessage({ type: "error", error: err.message }); } catch (e) {}
         });
     }
-    if (msg.type === "stop") {
-      stopRequested = true;
-      log("Stopped", "status");
-    }
+    if (msg.type === "stop") { stopRequested = true; log("Stopped", "status"); }
   });
   port.onDisconnect.addListener(() => { popupPort = null; });
 });
@@ -55,31 +50,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ===========================================================
-// AI — compact system prompt to save tokens
+// AI
 // ===========================================================
-const SYS = `Browser automation agent. Loop: see page, return next actions, repeat until done.
-JSON only: {"a":[...],"d":false}
-"a"=actions array, "d"=true when ENTIRE command is complete.
-Actions: navigate{"t":"nav","u":"url"} click{"t":"click","s":"sel"} fill{"t":"fill","s":"sel","v":"text"} key{"t":"key","s":"sel","k":"Enter"} submit{"t":"sub","s":"sel"} select{"t":"sel","s":"sel","v":"val"} check{"t":"chk","s":"sel","c":true} scroll{"t":"scr","dir":"down","amt":500} wait{"t":"wait","ms":1500} getText{"t":"txt","s":"sel"}
-Use sel="" attribute from page elements as CSS selector. Never guess selectors.
-After navigate, stop — new page comes next call.
-Search: fill input + key Enter. Login: fill fields + click submit.
-1-4 actions max per call. When all done: {"a":[],"d":true}`;
+const SYS = `You are a browser automation agent running in a LOOP.
 
-// Map compact keys back to full action objects
-function expandAction(a) {
-  const map = { nav: "navigate", click: "click", fill: "fill", key: "pressKey", sub: "submit", sel: "select", chk: "check", scr: "scroll", wait: "wait", txt: "getText" };
-  const action = { type: map[a.t] || a.t };
-  if (a.u) action.url = a.u;
-  if (a.s) action.selector = a.s;
-  if (a.v) action.value = a.v;
-  if (a.k) action.key = a.k;
-  if (a.c !== undefined) action.checked = a.c;
-  if (a.dir) action.direction = a.dir;
-  if (a.amt) action.amount = a.amt;
-  if (a.ms) action.duration = a.ms;
-  return action;
-}
+HOW THE LOOP WORKS:
+1. You receive the user's command and the current page state
+2. You return 1-4 actions to execute RIGHT NOW
+3. Those actions get executed
+4. You are called AGAIN with the NEW page state
+5. You return the NEXT actions
+6. This repeats until the ENTIRE command is done
+
+RESPONSE FORMAT — JSON only, no markdown:
+{"actions":[...],"done":false}
+
+CRITICAL RULES FOR "done":
+- "done":false means "I have more steps to do after these actions complete"
+- "done":true means "the user's ENTIRE command is 100% finished, every single part"
+- After a navigate action, ALWAYS return "done":false — you haven't seen the new page yet
+- If the command says "go to X AND do Y", done is false until Y is also completed
+- If the command has multiple parts (login, fill form, go somewhere), done is false until ALL parts are finished
+- Only return "done":true with an empty actions array when everything is complete
+
+ACTION TYPES:
+{"type":"navigate","url":"https://..."}
+{"type":"click","selector":"css selector"}
+{"type":"fill","selector":"css selector","value":"text"}
+{"type":"pressKey","selector":"css selector","key":"Enter"}
+{"type":"submit","selector":"css selector"}
+{"type":"select","selector":"css selector","value":"option"}
+{"type":"check","selector":"css selector","checked":true}
+{"type":"scroll","direction":"down","amount":500}
+{"type":"wait","duration":1500}
+{"type":"getText","selector":"css selector"}
+
+SELECTOR RULES:
+- Each page element has a sel="..." attribute. Use that EXACT value as your CSS selector.
+- NEVER invent or guess selectors. Only use what you see in the page elements.
+
+BEHAVIOR:
+- After navigate, STOP and return "done":false. You'll get the new page next call.
+- For search: fill the search box, then pressKey Enter on it.
+- For login: fill username/email, fill password, click the login/submit button.
+- When no page elements are shown, only navigate actions are possible.
+
+EXAMPLE LOOP for "go to youtube and search for cats":
+Call 1 → {"actions":[{"type":"navigate","url":"https://www.youtube.com"}],"done":false}
+Call 2 (sees youtube page) → {"actions":[{"type":"fill","selector":"input#search","value":"cats"},{"type":"pressKey","selector":"input#search","key":"Enter"}],"done":false}
+Call 3 (sees search results) → {"actions":[],"done":true}`;
 
 async function callAI(messages) {
   log("AI call...");
@@ -94,7 +113,7 @@ async function callAI(messages) {
   }
   const data = await res.json();
   const raw = data.choices[0].message.content.trim();
-  log(`AI raw: ${raw.substring(0, 200)}`);
+  log(`AI: ${raw.substring(0, 300)}`);
   return parseJSON(raw);
 }
 
@@ -102,20 +121,9 @@ function parseJSON(raw) {
   try { return JSON.parse(raw); } catch (e) {}
   const b = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (b) try { return JSON.parse(b[1].trim()); } catch (e) {}
-  const m = raw.match(/\{[\s\S]*"a"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/);
+  const m = raw.match(/\{[\s\S]*"actions"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/);
   if (m) try { return JSON.parse(m[0]); } catch (e) {}
-  // Try full-name format too (AI might ignore compact format)
-  const f = raw.match(/\{[\s\S]*"actions"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/);
-  if (f) try { return JSON.parse(f[0]); } catch (e) {}
   throw new Error("AI returned invalid JSON");
-}
-
-// Normalize response — handle both compact and full format
-function normalizeResponse(resp) {
-  const actions = resp.a || resp.actions || [];
-  const done = resp.d === true || resp.done === true;
-  const expanded = actions.map(a => a.t ? expandAction(a) : a);
-  return { actions: expanded, done };
 }
 
 // ===========================================================
@@ -144,10 +152,10 @@ async function waitLoad(tabId) {
 async function inject(tabId) {
   try { await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }); }
   catch (e) { throw new Error(`Can't access page: ${e.message}`); }
-  await sleep(100);
+  await sleep(150);
 }
 
-async function msg(tabId, type, payload = {}) {
+async function sendMsg(tabId, type, payload = {}) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("Timeout")), 10000);
     chrome.tabs.sendMessage(tabId, { type, ...payload }, (r) => {
@@ -159,11 +167,21 @@ async function msg(tabId, type, payload = {}) {
 }
 
 async function readPage(tabId) {
-  try {
-    await inject(tabId);
-    const r = await msg(tabId, "getPageContext");
-    if (r.context) { log(`Page: ${r.context.length} chars`); return r.context; }
-  } catch (e) { log(`Read fail: ${e.message}`); }
+  // Try up to 2 times in case page isn't ready yet
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await inject(tabId);
+      const r = await sendMsg(tabId, "getPageContext");
+      if (r.context && r.context.length > 50) {
+        log(`Page: ${r.context.length} chars`);
+        return r.context;
+      }
+    } catch (e) {
+      log(`Read attempt ${attempt + 1} failed: ${e.message}`);
+    }
+    // Wait before retry — page might still be loading
+    await sleep(1500);
+  }
   return null;
 }
 
@@ -177,7 +195,7 @@ async function runAction(action, tabId) {
     log(`Nav: ${action.url}`);
     await chrome.tabs.update(tabId, { url: action.url });
     await waitLoad(tabId);
-    await sleep(1200);
+    await sleep(1500);
     return { navigated: true };
   }
   if (action.type === "wait") {
@@ -187,7 +205,7 @@ async function runAction(action, tabId) {
 
   log(`${action.type}: ${action.selector || ""}`);
   await inject(tabId);
-  const result = await msg(tabId, "executeAction", { action });
+  const result = await sendMsg(tabId, "executeAction", { action });
   if (result.error) {
     const err = new ElementError(result.error);
     err.available = result.availableElements || "";
@@ -208,10 +226,9 @@ async function runWithRetry(action, tabId, command) {
         const ctx = isProtected(tab.url) ? null : await readPage(tab.id);
         const fix = await callAI([
           { role: "system", content: SYS },
-          { role: "user", content: `Fix failed action. Command:"${command}" Page:${tab.url}\n${ctx || ""}\nFailed:${JSON.stringify(action)} Err:${err.message}\n${err.available ? "Available:\n" + err.available : ""}\nReturn corrected action.` }
+          { role: "user", content: `Fix failed action. Command:"${command}" Page:${tab.url}\n${ctx ? "Page elements:\n" + ctx : ""}\nFailed:${JSON.stringify(action)} Error:${err.message}\n${err.available ? "Available elements:\n" + err.available : ""}\nReturn {"actions":[corrected action],"done":false}` }
         ]);
-        const norm = normalizeResponse(fix);
-        if (norm.actions[0]) { action = norm.actions[0]; }
+        if (fix.actions?.[0]) { action = fix.actions[0]; }
         else throw new Error("AI can't fix selector");
       } else throw err;
     }
@@ -226,52 +243,62 @@ async function handleCommand(command) {
   log(command, "status");
 
   const conv = [{ role: "system", content: SYS }];
-  let stepCount = 0;
+  let totalActions = 0;
 
   for (let step = 0; step < MAX_STEPS; step++) {
     if (stopRequested) throw new StopError();
 
+    // 1. Read current page
     const tab = await getTab();
-    const ctx = isProtected(tab.url) ? null : await readPage(tab.id);
-
-    // Build compact user message
-    let m = step === 0 ? `CMD:${command}\n` : `CMD:${command}\n`;
-    m += `URL:${tab.url}\n`;
-    m += ctx ? `ELS:\n${ctx}` : "No page elements. Navigate only.";
-
-    // Keep history tight — system + last 2 exchanges only
-    if (conv.length > 5) {
-      const sys = conv[0];
-      conv.splice(1, conv.length - 3);
-      conv[0] = sys;
+    let ctx = null;
+    if (!isProtected(tab.url)) {
+      ctx = await readPage(tab.id);
     }
+
+    // 2. Build message — always include full command
+    let m = `Command: ${command}\nCurrent page: ${tab.url}`;
+    if (step > 0) m += `\nPrevious actions were executed successfully. What's next?`;
+    if (ctx) {
+      m += `\n\nPage elements:\n${ctx}`;
+    } else {
+      m += `\n\nNo page elements available. Only navigate actions are possible.`;
+    }
+
+    // Keep conversation tight — system + last 3 exchanges
+    while (conv.length > 7) conv.splice(1, 2);
 
     conv.push({ role: "user", content: m });
-    const resp = normalizeResponse(await callAI(conv));
+
+    // 3. Call AI
+    const resp = await callAI(conv);
     conv.push({ role: "assistant", content: JSON.stringify(resp) });
 
-    if (resp.done) {
+    // 4. Check done
+    if (resp.done === true && (!resp.actions || resp.actions.length === 0)) {
       log("Task completed", "success");
       return;
     }
 
-    if (!resp.actions.length) {
+    const actions = resp.actions || [];
+    if (actions.length === 0) {
       log("Task completed", "success");
       return;
     }
 
-    stepCount += resp.actions.length;
-    log(`Working... (${stepCount} actions)`, "status");
+    totalActions += actions.length;
+    log(`Working... (${totalActions} actions)`, "status");
 
+    // 5. Execute
     let navigated = false;
-    for (const action of resp.actions) {
+    for (const action of actions) {
       if (stopRequested) throw new StopError();
       const t = await getTab();
       const r = await runWithRetry(action, t.id, command);
       if (r.navigated) navigated = true;
     }
 
-    if (navigated) await sleep(500);
+    // 6. After navigation, extra wait for page to settle
+    if (navigated) await sleep(800);
     await sleep(300);
   }
 
